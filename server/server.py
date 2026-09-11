@@ -64,7 +64,8 @@ def init_db():
             login_count INTEGER DEFAULT 0, revoked INTEGER DEFAULT 0, active INTEGER DEFAULT 1)""")
         conn.execute("""CREATE TABLE IF NOT EXISTS admins (
             telegram_id TEXT PRIMARY KEY, username TEXT DEFAULT '', first_name TEXT DEFAULT '',
-            role TEXT DEFAULT 'admin', added_at INTEGER NOT NULL, added_by TEXT, active INTEGER DEFAULT 1)""")
+            display_name TEXT DEFAULT 'Admin', role TEXT DEFAULT 'admin',
+            added_at INTEGER NOT NULL, added_by TEXT, active INTEGER DEFAULT 1)""")
         conn.execute("""CREATE TABLE IF NOT EXISTS license_keys (
             key TEXT PRIMARY KEY, created_at INTEGER NOT NULL, duration_days INTEGER NOT NULL,
             max_uses INTEGER NOT NULL, uses INTEGER DEFAULT 0, status TEXT DEFAULT 'active', created_by TEXT)""")
@@ -79,6 +80,7 @@ def init_db():
             "revoked": "INTEGER DEFAULT 0", "active": "INTEGER DEFAULT 1"})
         migrate_columns(conn, "admins", {
             "username": "TEXT DEFAULT ''", "first_name": "TEXT DEFAULT ''",
+            "display_name": "TEXT DEFAULT 'Admin'",
             "role": "TEXT DEFAULT 'admin'", "added_at": "INTEGER DEFAULT 0",
             "added_by": "TEXT DEFAULT ''", "active": "INTEGER DEFAULT 1"})
         migrate_columns(conn, "license_keys", {
@@ -98,6 +100,7 @@ def init_db():
         migrate_columns(conn, "admins", {
             "telegram_id": "TEXT DEFAULT ''",
             "username": "TEXT DEFAULT ''", "first_name": "TEXT DEFAULT ''",
+            "display_name": "TEXT DEFAULT 'Admin'",
             "role": "TEXT DEFAULT 'admin'", "added_at": "INTEGER DEFAULT 0",
             "added_by": "TEXT DEFAULT ''", "active": "INTEGER DEFAULT 1",
         })
@@ -112,6 +115,14 @@ def init_db():
             "key": "TEXT DEFAULT ''", "telegram_id": "TEXT DEFAULT ''",
             "redeemed_at": "INTEGER DEFAULT 0", "premium_until": "INTEGER DEFAULT 0",
         })
+        conn.commit()
+        owner = conn.execute("SELECT telegram_id FROM admins WHERE telegram_id=?", (str(OWNER_ID),)).fetchone()
+        if not owner:
+            conn.execute("INSERT INTO admins(telegram_id, role, added_at, added_by, active) VALUES(?,?,?,?,1)",
+                         (str(OWNER_ID), "owner", int(time.time()), "system"))
+        else:
+            conn.execute("UPDATE admins SET role='owner', active=1 WHERE telegram_id=?", (str(OWNER_ID),))
+        conn.execute("UPDATE admins SET display_name='Admin' WHERE display_name IS NULL OR TRIM(display_name)=''")
         conn.commit()
 
 def get_setting(name, default=""):
@@ -161,9 +172,7 @@ def premium_error(user):
         return "You must register before requesting an OTP."
     if user["revoked"] or not user["active"]:
         return "Your account is inactive. Contact an administrator."
-    if user["premium_until"] and user["premium_until"] <= int(time.time()):
-        return "Premium has expired; redeem a license key."
-    return "Premium is required to request an OTP."
+    return "Premium access is required for OTP. Contact @ZackZ10 or @kiora_AR to purchase/activate Premium."
 
 def expire_premium(user):
     if user and user["premium_until"] and user["premium_until"] <= int(time.time()) and user["plan"] != "free":
@@ -193,6 +202,53 @@ def is_owner(telegram_id):
         return True
     admin = get_admin(telegram_id)
     return admin and admin["role"] == "owner"
+
+def display_role(telegram_id):
+    if str(telegram_id) == str(OWNER_ID):
+        return "Dev/Zack"
+    admin = get_admin(telegram_id)
+    return "Seller/Admin" if admin and admin["active"] else "User"
+
+def admin_display_name(admin):
+    if str(admin["telegram_id"]) == str(OWNER_ID):
+        return "Dev/Zack"
+    return (admin["display_name"] or "Admin").strip() or "Admin"
+
+def format_user_record(user):
+    expire_premium(user)
+    user = get_user(user["telegram_id"])
+    plan = "Premium" if is_premium(user) else "Free"
+    status = "Active" if user["active"] and not user["revoked"] else "Revoked"
+    text = (f"`{user['telegram_id']}` | @{user['username'] or 'No username'}\n"
+            f"Role: {display_role(user['telegram_id'])} | Plan: {plan} | Status: {status}\n")
+    if is_premium(user):
+        expires = time.strftime("%Y-%m-%d %H:%M", time.localtime(user["premium_until"]))
+        text += f"Premium until: {expires} ({premium_remaining(user['premium_until'])})\n"
+    return text
+
+def format_user_info(user):
+    if not user:
+        return "❌ User not found"
+    expire_premium(user)
+    user = get_user(user["telegram_id"])
+    premium_until = int(user["premium_until"] or 0)
+    if is_premium(user):
+        premium_state = f"Active\nPremium until: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(premium_until))}\nRemaining: {premium_remaining(premium_until)}"
+    elif premium_until:
+        premium_state = f"Expired\nPremium until: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(premium_until))}\nRemaining: expired"
+    else:
+        premium_state = "Inactive\nPremium until: Not set\nRemaining: 0"
+    status = "Active" if user["active"] and not user["revoked"] else "Revoked"
+    return (f"👤 User Information\n\n"
+            f"Name: {user['first_name'] or 'No name'}\n"
+            f"Username: @{user['username'] or 'No username'}\n"
+            f"Telegram ID: {user['telegram_id']}\n"
+            f"Role: {display_role(user['telegram_id'])}\n"
+            f"Plan: {'Premium' if is_premium(user) else 'Free'}\n"
+            f"Status: {status}\n"
+            f"Premium: {premium_state}\n"
+            + ("" if is_premium(user) else
+               "Premium access is required for OTP. Contact @ZackZ10 or @kiora_AR to purchase/activate Premium."))
 
 def send_msg(chat_id, text, keyboard=None, photo=None, **kw):
     payload = {"chat_id": chat_id}
@@ -270,6 +326,14 @@ def handle_command(chat_id, username, first_name, command, args):
         send_msg(chat_id, text, parse_mode="Markdown")
         return True
 
+    if command == "/userinfo":
+        if len(args) > 1 or (args and (not args[0].isdigit() or not is_admin(chat_id))):
+            send_msg(chat_id, "❌ Usage: /userinfo [telegram_id]. An ID requires active admin authorization.")
+            return True
+        target_id = args[0] if args else str(chat_id)
+        send_msg(chat_id, format_user_info(get_user(target_id)))
+        return True
+
     if command == "/otp":
         user = get_user(chat_id)
         expire_premium(user)
@@ -339,34 +403,37 @@ def handle_command(chat_id, username, first_name, command, args):
 
     if command == "/users":
         with db() as conn:
-            users = conn.execute("SELECT * FROM users ORDER BY registered_at DESC LIMIT 50").fetchall()
-        text = "👥 *Users*\n\n" + "".join(
-            f"`{user['telegram_id']}` | @{user['username'] or 'n/a'} | {'Premium' if is_premium(user) else 'Free'}\n"
-            for user in users
-        )
+            users = conn.execute("SELECT * FROM users ORDER BY registered_at DESC").fetchall()
+        text = "👥 *Users*\n\n" + "".join(format_user_record(user) for user in users)
         send_msg(chat_id, text if users else "👥 No users", parse_mode="Markdown")
         return True
 
     if command == "/givepremium":
-        if len(args) != 2:
-            send_msg(chat_id, "Usage: /givepremium <telegram_id> <days>")
+        if len(args) not in (1, 2):
+            send_msg(chat_id, "Usage: /givepremium <days> or /givepremium <telegram_id> <days>")
+            return True
+        target_id = str(chat_id) if len(args) == 1 else args[0]
+        days_arg = args[0] if len(args) == 1 else args[1]
+        if len(args) == 2 and (not target_id.isdigit() or not is_admin(chat_id)):
+            send_msg(chat_id, "❌ Telegram ID must be numeric and you must be an active admin")
             return True
         try:
-            days = int(args[1])
+            days = int(days_arg)
             if days <= 0:
                 raise ValueError
         except ValueError:
             send_msg(chat_id, "❌ Days must be a positive integer")
             return True
-        user = get_user(args[0])
+        user = get_user(target_id)
         if not user:
             send_msg(chat_id, "❌ User not found")
             return True
         premium_until = int(time.time()) + days * 86400
         with db() as conn:
-            conn.execute("UPDATE users SET plan='premium', premium_until=? WHERE telegram_id=?", (premium_until, args[0]))
+            conn.execute("UPDATE users SET plan='premium', premium_until=? WHERE telegram_id=?", (premium_until, target_id))
             conn.commit()
-        send_msg(chat_id, f"✅ Premium given to {args[0]} for {days} days")
+        updated = get_user(target_id)
+        send_msg(chat_id, f"✅ Premium granted to {target_id} for {days} days\n\n{format_user_info(updated)}")
         return True
 
     if command == "/removepremium":
@@ -393,16 +460,26 @@ def handle_command(chat_id, username, first_name, command, args):
         return True
 
     if command == "/addadmin":
-        if not is_owner(chat_id) or len(args) != 1:
-            send_msg(chat_id, "❌ Owner only. Usage: /addadmin <telegram_id>")
+        if not is_owner(chat_id) or len(args) < 1:
+            send_msg(chat_id, "❌ Owner only. Usage: /addadmin <telegram_id> [display_name]")
             return True
+        display_name = " ".join(args[1:]).strip() or "Admin"
         target = get_user(args[0])
         with db() as conn:
-            conn.execute("INSERT OR REPLACE INTO admins(telegram_id, username, first_name, role, added_at, added_by, active) VALUES(?,?,?,?,?,?,1)",
-                         (args[0], target["username"] if target else "", target["first_name"] if target else "",
-                          "admin", int(time.time()), chat_id))
+            existing = conn.execute("SELECT telegram_id FROM admins WHERE telegram_id=?", (args[0],)).fetchone()
+            if existing:
+                conn.execute("UPDATE admins SET display_name=?, username=?, first_name=?, active=1 "
+                             "WHERE telegram_id=?",
+                             (display_name, target["username"] if target else "",
+                              target["first_name"] if target else "", args[0]))
+            else:
+                conn.execute("INSERT INTO admins(telegram_id, username, first_name, display_name, role, "
+                             "added_at, added_by, active) VALUES(?,?,?,?,?,?,?,1)",
+                             (args[0], target["username"] if target else "",
+                              target["first_name"] if target else "", display_name,
+                              "admin", int(time.time()), chat_id))
             conn.commit()
-        send_msg(chat_id, "✅ Admin added")
+        send_msg(chat_id, f"Seller/Admin added: {display_name} (ID: {args[0]})")
         return True
 
     if command == "/removeadmin":
@@ -423,9 +500,12 @@ def handle_command(chat_id, username, first_name, command, args):
             send_msg(chat_id, "❌ Owner only")
             return True
         with db() as conn:
-            admins = conn.execute("SELECT * FROM admins WHERE active=1 ORDER BY added_at DESC").fetchall()
+            admins = conn.execute("SELECT * FROM admins ORDER BY added_at DESC").fetchall()
         text = "👮 *Admins*\n\n" + "".join(
-            f"{'👑' if admin['role'] == 'owner' else '🛡'} {admin['role']} | ID: {admin['telegram_id']}\n"
+            f"{'👑' if admin['telegram_id'] == str(OWNER_ID) else '🛡'} {admin_display_name(admin)} | "
+            f"ID: {admin['telegram_id']} | @{admin['username'] or 'No username'} | "
+            f"{'Active' if admin['active'] else 'Revoked'} | "
+            f"Added: {time.strftime('%Y-%m-%d', time.localtime(admin['added_at']))}\n"
             for admin in admins
         )
         send_msg(chat_id, text, parse_mode="Markdown")
@@ -484,7 +564,9 @@ def show_user_panel(chat_id, msg_id=None):
     user = get_user(chat_id)
     is_prem = is_premium(user)
     display_name = user["first_name"] or user["username"] or "User"
-    text = f"👋 *Welcome, {display_name}!*\n\n💎 Plan: *{'Premium' if is_prem else 'Free'}*"
+    text = (f"👋 *Welcome, {display_name}!*\n\n"
+            f"💎 Plan: *{'Premium' if is_prem else 'Free'}*\n"
+            f"🛡️ Role: *{display_role(chat_id)}*")
     custom_welcome = get_setting("welcome_text")
     if custom_welcome:
         text = f"{custom_welcome}\n\n{text}"
@@ -585,13 +667,16 @@ def handle_callback(callback_id, from_id, msg_id, chat_id, data):
         if is_premium(user):
             expires = time.strftime("%Y-%m-%d %H:%M", time.localtime(user["premium_until"]))
             text = (f"💎 *Premium Status*\n\n✅ Premium / Active\n"
-                    f"⏰ Expires: {expires}\n⏳ Remaining: {premium_remaining(user['premium_until'])}")
+                    f"⏰ Expires: {expires}\n⏳ Remaining: {premium_remaining(user['premium_until'])}\n"
+                    f"🛡️ Role: {display_role(chat_id)}")
         else:
             text = "💎 *Premium Status*\n\n"
             if user["premium_until"]:
-                text += "⚠️ Premium expired.\nOTP is blocked until you redeem a license key."
+                text += "⚠️ Premium expired.\nOTP is blocked.\n"
             else:
-                text += "ℹ️ Free / Inactive.\nPremium is required for OTP access."
+                text += "ℹ️ Free / Inactive.\n"
+            text += "Premium access is required for OTP. Contact @ZackZ10 or @kiora_AR to purchase/activate Premium."
+            text += f"\n🛡️ Role: {display_role(chat_id)}"
         edit_msg(chat_id, msg_id, text, [[{"text": "← Back", "callback_data": "back_main"}]], parse_mode="Markdown")
         answer_callback(callback_id)
         return
@@ -654,8 +739,7 @@ def handle_callback(callback_id, from_id, msg_id, chat_id, data):
         users_page = all_users[start:start + per_page]
         text = f"👥 *Users* (Page {page + 1}/{pages})\n\n"
         for u in users_page:
-            plan = "Premium" if is_premium(u) else "Free"
-            text += f"`{u['telegram_id']}` | @{u['username'] or 'n/a'} | {plan}\n"
+            text += format_user_record(u) + "\n"
         keyboard = []
         if page > 0:
             keyboard.append({"text": "← Back", "callback_data": f"admin_users_{page-1}"})
@@ -705,8 +789,11 @@ def handle_callback(callback_id, from_id, msg_id, chat_id, data):
         admins_page = all_admins[start:start + per_page]
         text = f"👮 *Admins* (Page {page + 1}/{pages})\n\n"
         for a in admins_page:
-            icon = "👑" if a["role"] == "owner" else "🛡"
-            text += f"{icon} {a['role']} | @{a['username'] or 'n/a'} | ID: {a['telegram_id']}\n"
+            icon = "👑" if a["telegram_id"] == str(OWNER_ID) else "🛡"
+            status = "Active" if a["active"] else "Revoked"
+            added = time.strftime("%Y-%m-%d", time.localtime(a["added_at"]))
+            text += (f"{icon} {admin_display_name(a)} | ID: {a['telegram_id']} | "
+                     f"@{a['username'] or 'No username'} | {status} | Added: {added}\n")
         keyboard = []
         if page > 0:
             keyboard.append({"text": "← Back", "callback_data": f"admin_admins_{page-1}"})
