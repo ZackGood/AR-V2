@@ -129,6 +129,183 @@ def edit_msg(chat_id, msg_id, text, keyboard=None, **kw):
 def answer_callback(callback_id, text="", alert=False):
     telegram_call("answerCallbackQuery", {"callback_query_id": callback_id, "text": text, "show_alert": alert})
 
+def handle_command(chat_id, username, first_name, command, args):
+    if command == "/stats":
+        user = get_user(chat_id)
+        if not user:
+            send_msg(chat_id, "❌ Not registered. Use /register")
+            return True
+        text = f"📊 *Stats*\n\n🆔 `{user['telegram_id']}`\n👤 @{user['username'] or 'n/a'}\n✅ Logins: {user['login_count']}\n📅 Registered: {time.strftime('%Y-%m-%d', time.localtime(user['registered_at']))}"
+        send_msg(chat_id, text, parse_mode="Markdown")
+        return True
+
+    if command == "/otp":
+        user = get_user(chat_id)
+        if not user:
+            send_msg(chat_id, "❌ Not registered. Use /register")
+        elif not is_premium(user):
+            send_msg(chat_id, "❌ Premium required!")
+        else:
+            otp = f"{secrets.randbelow(1_000_000):06d}"
+            OTPS[chat_id] = {"otp": otp, "expires": int(time.time()) + OTP_TTL, "attempts": 0}
+            send_msg(chat_id, f"🔐 *OTP Code*\n\n`{otp}`\n\n⏱ Valid for 5 minutes", parse_mode="Markdown")
+        return True
+
+    if command == "/redeem":
+        if args:
+            set_user_state(chat_id, action="redeem_key")
+            handle_message({"chat": {"id": chat_id}, "from": {"username": username, "first_name": first_name},
+                            "text": args[0]})
+        else:
+            send_msg(chat_id, "🎟️ Send me the license key to redeem (or /cancel)")
+            set_user_state(chat_id, action="redeem_key")
+        return True
+
+    if command in ("/key", "/keys", "/revokekey", "/users", "/givepremium", "/removepremium",
+                   "/revoke", "/addadmin", "/removeadmin", "/admins"):
+        if not is_admin(chat_id):
+            send_msg(chat_id, "❌ Unauthorized")
+            return True
+
+    if command == "/key":
+        if not is_owner(chat_id):
+            send_msg(chat_id, "❌ Owner only")
+            return True
+        if len(args) not in (1, 2):
+            send_msg(chat_id, "Usage: /key <days> [uses]")
+            return True
+        try:
+            days = int(args[0])
+            uses = int(args[1]) if len(args) == 2 else 1
+            if days <= 0 or uses <= 0:
+                raise ValueError
+        except ValueError:
+            send_msg(chat_id, "❌ Days and uses must be positive integers")
+            return True
+        key = secrets.token_urlsafe(16)
+        with db() as conn:
+            conn.execute("INSERT INTO license_keys(key, created_at, duration_days, max_uses, uses, status, created_by) VALUES(?,?,?,?,?,?,?)",
+                         (key, int(time.time()), days, uses, 0, "active", chat_id))
+            conn.commit()
+        send_msg(chat_id, f"🔑 Key Generated:\n\n`{key}`", parse_mode="Markdown")
+        return True
+
+    if command == "/keys":
+        with db() as conn:
+            keys = conn.execute("SELECT * FROM license_keys ORDER BY created_at DESC LIMIT 50").fetchall()
+        text = "🗝️ *License Keys*\n\n" + "".join(
+            f"`{key['key'][:16]}...` | {key['duration_days']}d | {key['uses']}/{key['max_uses']} | {key['status']}\n"
+            for key in keys
+        )
+        send_msg(chat_id, text if keys else "🗝️ No license keys", parse_mode="Markdown")
+        return True
+
+    if command == "/revokekey":
+        if len(args) != 1:
+            send_msg(chat_id, "Usage: /revokekey <key>")
+            return True
+        with db() as conn:
+            result = conn.execute("UPDATE license_keys SET status='revoked' WHERE key=? AND status='active'", (args[0],))
+            conn.commit()
+        send_msg(chat_id, "✅ Key revoked" if result.rowcount else "❌ Active key not found")
+        return True
+
+    if command == "/users":
+        with db() as conn:
+            users = conn.execute("SELECT * FROM users ORDER BY registered_at DESC LIMIT 50").fetchall()
+        text = "👥 *Users*\n\n" + "".join(
+            f"`{user['telegram_id']}` | @{user['username'] or 'n/a'} | {'Premium' if is_premium(user) else 'Free'}\n"
+            for user in users
+        )
+        send_msg(chat_id, text if users else "👥 No users", parse_mode="Markdown")
+        return True
+
+    if command == "/givepremium":
+        if len(args) != 2:
+            send_msg(chat_id, "Usage: /givepremium <telegram_id> <days>")
+            return True
+        try:
+            days = int(args[1])
+            if days <= 0:
+                raise ValueError
+        except ValueError:
+            send_msg(chat_id, "❌ Days must be a positive integer")
+            return True
+        user = get_user(args[0])
+        if not user:
+            send_msg(chat_id, "❌ User not found")
+            return True
+        premium_until = int(time.time()) + days * 86400
+        with db() as conn:
+            conn.execute("UPDATE users SET plan='premium', premium_until=? WHERE telegram_id=?", (premium_until, args[0]))
+            conn.commit()
+        send_msg(chat_id, f"✅ Premium given to {args[0]} for {days} days")
+        return True
+
+    if command == "/removepremium":
+        if len(args) != 1:
+            send_msg(chat_id, "Usage: /removepremium <telegram_id>")
+            return True
+        with db() as conn:
+            result = conn.execute("UPDATE users SET plan='free', premium_until=0 WHERE telegram_id=?", (args[0],))
+            conn.commit()
+        send_msg(chat_id, "✅ Premium removed" if result.rowcount else "❌ User not found")
+        return True
+
+    if command == "/revoke":
+        if len(args) != 1:
+            send_msg(chat_id, "Usage: /revoke <telegram_id>")
+            return True
+        if str(args[0]) == str(OWNER_ID):
+            send_msg(chat_id, "❌ Cannot revoke owner")
+            return True
+        with db() as conn:
+            result = conn.execute("UPDATE users SET revoked=1, active=0 WHERE telegram_id=?", (args[0],))
+            conn.commit()
+        send_msg(chat_id, "✅ User revoked" if result.rowcount else "❌ User not found")
+        return True
+
+    if command == "/addadmin":
+        if not is_owner(chat_id) or len(args) != 1:
+            send_msg(chat_id, "❌ Owner only. Usage: /addadmin <telegram_id>")
+            return True
+        target = get_user(args[0])
+        with db() as conn:
+            conn.execute("INSERT OR REPLACE INTO admins(telegram_id, username, first_name, role, added_at, added_by, active) VALUES(?,?,?,?,?,?,1)",
+                         (args[0], target["username"] if target else "", target["first_name"] if target else "",
+                          "admin", int(time.time()), chat_id))
+            conn.commit()
+        send_msg(chat_id, "✅ Admin added")
+        return True
+
+    if command == "/removeadmin":
+        if not is_owner(chat_id) or len(args) != 1:
+            send_msg(chat_id, "❌ Owner only. Usage: /removeadmin <telegram_id>")
+            return True
+        if str(args[0]) == str(OWNER_ID):
+            send_msg(chat_id, "❌ Cannot remove owner")
+            return True
+        with db() as conn:
+            result = conn.execute("UPDATE admins SET active=0 WHERE telegram_id=?", (args[0],))
+            conn.commit()
+        send_msg(chat_id, "✅ Admin removed" if result.rowcount else "❌ Admin not found")
+        return True
+
+    if command == "/admins":
+        if not is_owner(chat_id):
+            send_msg(chat_id, "❌ Owner only")
+            return True
+        with db() as conn:
+            admins = conn.execute("SELECT * FROM admins WHERE active=1 ORDER BY added_at DESC").fetchall()
+        text = "👮 *Admins*\n\n" + "".join(
+            f"{'👑' if admin['role'] == 'owner' else '🛡'} {admin['role']} | ID: {admin['telegram_id']}\n"
+            for admin in admins
+        )
+        send_msg(chat_id, text, parse_mode="Markdown")
+        return True
+
+    return False
+
 OTPS = {}
 SESSIONS = {}
 OFFSET = None
@@ -339,6 +516,20 @@ def handle_message(msg):
     
     username = sender.get("username") or ""
     first_name = sender.get("first_name") or ""
+
+    if text.startswith("/"):
+        command_parts = text.split()
+        command = command_parts[0].split("@", 1)[0].lower()
+        if command == "/start":
+            upsert_user(chat_id, username, first_name)
+            show_user_panel(chat_id)
+            return
+        if command == "/register":
+            upsert_user(chat_id, username, first_name)
+            send_msg(chat_id, "✅ Registered as Free. Use /start to continue.")
+            return
+        if handle_command(chat_id, username, first_name, command, command_parts[1:]):
+            return
     
     state = get_user_state(chat_id)
     
@@ -439,17 +630,6 @@ def handle_message(msg):
         show_admin_panel(chat_id)
         return
     
-    if text.startswith("/"):
-        command = text.split()[0].lower()
-        if command == "/start":
-            upsert_user(chat_id, username, first_name)
-            show_user_panel(chat_id)
-            return
-        if command == "/register":
-            upsert_user(chat_id, username, first_name)
-            send_msg(chat_id, "✅ Registered as Free. Use /start to continue.")
-            return
-
 def telegram_poll():
     global OFFSET
     print("Telegram bot active with interactive menus")
