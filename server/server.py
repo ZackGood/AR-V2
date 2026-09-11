@@ -174,6 +174,34 @@ def premium_error(user):
         return "Your account is inactive. Contact an administrator."
     return "Premium access is required for OTP. Contact @ZackZ10 or @kiora_AR to purchase/activate Premium."
 
+def owner_otp_blocked():
+    return "OTP access is not available for the owner account."
+
+def notify_authentication(user, user_id, expires_at):
+    if str(user_id) == str(OWNER_ID):
+        return
+    display_name = user["first_name"] or user["username"] or "User"
+    username = f" (@{user['username']})" if user["username"] else ""
+    premium_status = "Premium active" if is_premium(user) else "Premium inactive"
+    timestamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+    remaining = premium_remaining(expires_at)
+    message = (f"User authenticated / logged in\n"
+               f"User: {display_name}{username}\n"
+               f"Telegram ID: {user_id}\n"
+               f"Premium status: {premium_status}\n"
+               f"Timestamp: {timestamp}\n"
+               f"Session remaining: {remaining}")
+    try:
+        send_msg(OWNER_ID, message)
+    except Exception as error:
+        print(f"Authentication notification failed: {error}")
+
+def notify_user_authenticated(user_id, expires_at):
+    try:
+        send_msg(user_id, f"✅ Logged in successfully. Session remaining: {premium_remaining(expires_at)}.")
+    except Exception as error:
+        print(f"User authentication confirmation failed: {error}")
+
 def expire_premium(user):
     if user and user["premium_until"] and user["premium_until"] <= int(time.time()) and user["plan"] != "free":
         with db() as conn:
@@ -338,7 +366,9 @@ def handle_command(chat_id, username, first_name, command, args):
     if command == "/otp":
         user = get_user(chat_id)
         expire_premium(user)
-        if not is_premium(user):
+        if str(chat_id) == str(OWNER_ID):
+            send_msg(chat_id, owner_otp_blocked())
+        elif not is_premium(user):
             send_msg(chat_id, f"❌ {premium_error(user)}")
         else:
             otp = f"{secrets.randbelow(1_000_000):06d}"
@@ -718,6 +748,9 @@ def handle_callback(callback_id, from_id, msg_id, chat_id, data):
     
     if data == "request_otp":
         expire_premium(user)
+        if str(chat_id) == str(OWNER_ID):
+            answer_callback(callback_id, owner_otp_blocked(), alert=True)
+            return
         if not is_premium(user):
             answer_callback(callback_id, premium_error(user), alert=True)
             return
@@ -1034,6 +1067,12 @@ class Handler(BaseHTTPRequestHandler):
             user_id = str(data.get("userId", "")).strip()
             user = get_user(user_id)
             expire_premium(user)
+            if user_id == str(OWNER_ID):
+                self.send_response(403)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(json.dumps({"success": False, "error": owner_otp_blocked()}).encode())
+                return
             if not is_premium(user):
                 self.send_response(403)
                 self.send_header("Content-Type", "application/json")
@@ -1056,6 +1095,12 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/verify-otp":
             user_id = str(data.get("userId", "")).strip()
             otp = str(data.get("otp", "")).strip()
+            if user_id == str(OWNER_ID):
+                self.send_response(403)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(json.dumps({"success": False, "error": owner_otp_blocked()}).encode())
+                return
             record = OTPS.get(user_id)
             now = int(time.time())
             if not record or record["expires"] <= now or otp != record["otp"]:
@@ -1079,12 +1124,9 @@ class Handler(BaseHTTPRequestHandler):
             SESSIONS[session] = {"user_id": user_id, "expires_at": now + SESSION_TTL}
             upsert_user(user_id, user["username"], user["first_name"], increment_login=True)
             user = get_user(user_id)
-            display_name = user["first_name"] or user["username"] or "User"
-            try:
-                send_msg(OWNER_ID, f"User authenticated: {display_name}, Telegram ID {user_id}, "
-                                   f"Session remaining: {SESSION_TTL // 3600} hours")
-            except Exception as error:
-                print(f"Authentication notification failed: {error}")
+            expires_at = SESSIONS[session]["expires_at"]
+            notify_user_authenticated(user_id, expires_at)
+            notify_authentication(user, user_id, expires_at)
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.end_headers()
