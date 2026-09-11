@@ -171,6 +171,13 @@ def expire_premium(user):
             conn.execute("UPDATE users SET plan='free' WHERE telegram_id=?", (user["telegram_id"],))
             conn.commit()
 
+def premium_remaining(until):
+    remaining = max(0, int(until) - int(time.time()))
+    days, remainder = divmod(remaining, 86400)
+    hours, remainder = divmod(remainder, 3600)
+    minutes, _ = divmod(remainder, 60)
+    return f"{days}d {hours}h {minutes}m"
+
 def get_admin(telegram_id):
     with db() as conn:
         return conn.execute("SELECT * FROM admins WHERE telegram_id=?", (str(telegram_id),)).fetchone()
@@ -476,40 +483,27 @@ def show_user_panel(chat_id, msg_id=None):
     expire_premium(user)
     user = get_user(chat_id)
     is_prem = is_premium(user)
-    plan = "Premium" if is_prem else "Free"
     display_name = user["first_name"] or user["username"] or "User"
-    text = (f"🤖 *AR-V2*\n👋 Welcome, {display_name}!\n\n"
-            "*Information*\n• Bot Version: AR-V2\n• Operator: AR-V2 Operations\n"
-            "• Authorized Users: Telegram ID access\n• Premium Users: Premium plan access\n\n"
-            "*Capabilities*\n• Hitters: HTTP request API\n• Checkers: OTP verification\n"
-            "• Tools: License and account management\n\n"
-            f"🆔 Telegram ID: `{user['telegram_id']}`\n💎 Plan: *{plan}*")
+    text = f"👋 *Welcome, {display_name}!*\n\n💎 Plan: *{'Premium' if is_prem else 'Free'}*"
     custom_welcome = get_setting("welcome_text")
     if custom_welcome:
         text = f"{custom_welcome}\n\n{text}"
     if is_prem:
         expires = time.strftime("%Y-%m-%d %H:%M", time.localtime(user["premium_until"]))
-        text += f"\n✅ Status: Active\n⏰ Expires: {expires}"
+        text += f"\n✅ Status: Active\n⏰ Expires: {expires}\n⏳ Remaining: {premium_remaining(user['premium_until'])}"
     else:
-        text += "\nℹ️ Status: Free"
+        if user["premium_until"]:
+            text += "\n⚠️ Premium expired. OTP is blocked; redeem a license key."
     
     keyboard = [
-        [{"text": "📋 Overview", "callback_data": "overview"}],
-        [{"text": "🆔 My User ID", "callback_data": "user_id"},
-         {"text": "💎 Premium Status", "callback_data": "premium_status"}],
+        [{"text": "💎 Premium Status", "callback_data": "premium_status"}],
         [{"text": "ℹ️ OTP Info", "callback_data": "otp_info"},
          {"text": "📊 My Stats", "callback_data": "user_stats"}],
         [{"text": "🎟️ Redeem Key", "callback_data": "redeem_key"},
          {"text": "🔐 Request OTP", "callback_data": "request_otp"}],
     ]
-    community = get_setting("community_url")
-    if community:
-        keyboard.append([{"text": "🌐 Community", "url": community}])
-    
     if is_admin(chat_id):
         keyboard.append([{"text": "🛠️ Admin Panel", "callback_data": "admin_panel"}])
-    if is_owner(chat_id):
-        keyboard[0].append({"text": "⚙️ Settings", "callback_data": "settings"})
     
     try:
         if msg_id:
@@ -582,30 +576,6 @@ def handle_callback(callback_id, from_id, msg_id, chat_id, data):
         answer_callback(callback_id)
         return
 
-    info_cards = {
-        "overview": "📋 *Overview*\n\nUse the menu to manage your AR-V2 account, Premium access, OTP, and licenses.",
-    }
-    if data in info_cards:
-        edit_msg(chat_id, msg_id, info_cards[data],
-                 [[{"text": "← Back to Overview", "callback_data": "back_main"}]], parse_mode="Markdown")
-        answer_callback(callback_id)
-        return
-
-    if data == "download_extension":
-        edit_msg(chat_id, msg_id, "⬇️ *Download Extension*\n\nThe extension download will be available here soon.",
-                 [[{"text": "← Back", "callback_data": "back_main"}]], parse_mode="Markdown")
-        answer_callback(callback_id)
-        return
-
-    if data == "user_id":
-        if not user:
-            answer_callback(callback_id, "Not registered", alert=True)
-            return
-        edit_msg(chat_id, msg_id, f"🆔 *Your Telegram ID*\n\n`{user['telegram_id']}`",
-                 [[{"text": "← Back", "callback_data": "back_main"}]], parse_mode="Markdown")
-        answer_callback(callback_id)
-        return
-
     if data == "premium_status":
         if not user:
             answer_callback(callback_id, "Not registered", alert=True)
@@ -614,18 +584,21 @@ def handle_callback(callback_id, from_id, msg_id, chat_id, data):
         user = get_user(chat_id)
         if is_premium(user):
             expires = time.strftime("%Y-%m-%d %H:%M", time.localtime(user["premium_until"]))
-            text = f"💎 *Premium Status*\n\n✅ Active\n⏰ Expires: {expires}"
+            text = (f"💎 *Premium Status*\n\n✅ Premium / Active\n"
+                    f"⏰ Expires: {expires}\n⏳ Remaining: {premium_remaining(user['premium_until'])}")
         else:
-            text = "💎 *Premium Status*\n\nℹ️ You are on the Free plan.\n"
+            text = "💎 *Premium Status*\n\n"
             if user["premium_until"]:
-                text += "Premium has expired; OTP access is disabled until you redeem a license key."
+                text += "⚠️ Premium expired.\nOTP is blocked until you redeem a license key."
+            else:
+                text += "ℹ️ Free / Inactive.\nPremium is required for OTP access."
         edit_msg(chat_id, msg_id, text, [[{"text": "← Back", "callback_data": "back_main"}]], parse_mode="Markdown")
         answer_callback(callback_id)
         return
 
     if data == "otp_info":
-        edit_msg(chat_id, msg_id, "ℹ️ *OTP Info*\n\nOTP access requires an active Premium plan. "
-                 "Codes are valid for 5 minutes. After Premium expires, redeem a license key to restore access.",
+        edit_msg(chat_id, msg_id, "ℹ️ *OTP Info*\n\nPremium is required. Each OTP is valid for 5 minutes "
+                 "and can be used once. A successful verification creates a 24-hour session.",
                  [[{"text": "← Back", "callback_data": "back_main"}]], parse_mode="Markdown")
         answer_callback(callback_id)
         return
@@ -653,8 +626,9 @@ def handle_callback(callback_id, from_id, msg_id, chat_id, data):
         otp = f"{secrets.randbelow(1_000_000):06d}"
         now = int(time.time())
         OTPS[str(chat_id)] = {"otp": otp, "expires": now + OTP_TTL, "attempts": 0}
-        send_msg(chat_id, f"🔐 *OTP Code*\n\n`{otp}`\n\n⏱ Valid for 5 minutes", parse_mode="Markdown")
-        telegram_call("sendMessage", {"chat_id": chat_id, "text": f"✅ OTP sent!"})
+        edit_msg(chat_id, msg_id, "🔐 *OTP Code*\n\n"
+                 f"`{otp}`\n\n⏱ Valid for 5 minutes • Single-use\n🔑 Session: 24 hours",
+                 [[{"text": "← Back", "callback_data": "back_main"}]], parse_mode="Markdown")
         answer_callback(callback_id)
         return
     
@@ -843,7 +817,9 @@ def handle_message(msg):
             conn.commit()
         
         expires = time.strftime("%Y-%m-%d", time.localtime(new_prem))
-        send_msg(chat_id, f"✅ Premium activated!\n\n⏰ Expires: {expires}\n🎉 Enjoy!", parse_mode="Markdown")
+        send_msg(chat_id, f"✅ Premium activated!\n\n"
+                          f"⏳ Duration: {k['duration_days']} days\n"
+                          f"⏰ Expires: {expires}\n🎉 Enjoy!", parse_mode="Markdown")
         set_user_state(chat_id, action=None)
         show_user_panel(chat_id)
         return
