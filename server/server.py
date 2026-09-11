@@ -49,6 +49,12 @@ def db():
     conn.row_factory = sqlite3.Row
     return conn
 
+def migrate_columns(conn, table, columns):
+    existing = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
+    for name, definition in columns.items():
+        if name not in existing:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {definition}")
+
 def init_db():
     with db() as conn:
         conn.execute("""CREATE TABLE IF NOT EXISTS users (
@@ -63,6 +69,30 @@ def init_db():
             max_uses INTEGER NOT NULL, uses INTEGER DEFAULT 0, status TEXT DEFAULT 'active', created_by TEXT)""")
         conn.execute("""CREATE TABLE IF NOT EXISTS key_redemptions (
             id INTEGER PRIMARY KEY, key TEXT, telegram_id TEXT, redeemed_at INTEGER, premium_until INTEGER)""")
+        migrate_columns(conn, "users", {
+            "telegram_id": "TEXT DEFAULT ''",
+            "username": "TEXT DEFAULT ''", "first_name": "TEXT DEFAULT ''",
+            "plan": "TEXT DEFAULT 'free'", "premium_until": "INTEGER DEFAULT 0",
+            "registered_at": "INTEGER DEFAULT 0", "login_count": "INTEGER DEFAULT 0",
+            "revoked": "INTEGER DEFAULT 0", "active": "INTEGER DEFAULT 1",
+        })
+        migrate_columns(conn, "admins", {
+            "telegram_id": "TEXT DEFAULT ''",
+            "username": "TEXT DEFAULT ''", "first_name": "TEXT DEFAULT ''",
+            "role": "TEXT DEFAULT 'admin'", "added_at": "INTEGER DEFAULT 0",
+            "added_by": "TEXT DEFAULT ''", "active": "INTEGER DEFAULT 1",
+        })
+        migrate_columns(conn, "license_keys", {
+            "key": "TEXT DEFAULT ''",
+            "created_at": "INTEGER DEFAULT 0", "duration_days": "INTEGER DEFAULT 0",
+            "max_uses": "INTEGER DEFAULT 0", "uses": "INTEGER DEFAULT 0",
+            "status": "TEXT DEFAULT 'active'", "created_by": "TEXT DEFAULT ''",
+        })
+        migrate_columns(conn, "key_redemptions", {
+            "id": "INTEGER DEFAULT 0",
+            "key": "TEXT DEFAULT ''", "telegram_id": "TEXT DEFAULT ''",
+            "redeemed_at": "INTEGER DEFAULT 0", "premium_until": "INTEGER DEFAULT 0",
+        })
         conn.commit()
         owner = conn.execute("SELECT * FROM admins WHERE telegram_id=?", (str(OWNER_ID),)).fetchone()
         if not owner:
@@ -326,7 +356,20 @@ def show_user_panel(chat_id):
     is_prem = is_premium(user)
     plan = "Premium" if is_prem else "Free"
     display_name = user["first_name"] or user["username"] or "User"
-    text = f"👋 *Welcome, {display_name}!*\n\n🆔 Telegram ID: `{user['telegram_id']}`\n💎 Plan: *{plan}*"
+    text = (
+        f"🤖 *AR-V2 Control Panel*\n"
+        f"👋 Welcome, {display_name}!\n\n"
+        "*Information*\n"
+        "• Bot Version: AR-V2\n"
+        "• Operator: AR-V2 Operations\n"
+        "• Authorized Users: Telegram ID access\n"
+        "• Premium Users: Premium plan access\n\n"
+        "*Capabilities*\n"
+        "• Hitters: HTTP request API\n"
+        "• Checkers: OTP verification\n"
+        "• Tools: License and account management\n\n"
+        f"🆔 Telegram ID: `{user['telegram_id']}`\n💎 Plan: *{plan}*"
+    )
     if is_prem:
         expires = time.strftime("%Y-%m-%d %H:%M", time.localtime(user["premium_until"]))
         text += f"\n✅ Status: Active\n⏰ Expires: {expires}"
@@ -334,13 +377,18 @@ def show_user_panel(chat_id):
         text += "\nℹ️ Status: Free"
     
     keyboard = [
-        [{"text": "⬇️ Download Extension", "callback_data": "download_extension"}],
-        [{"text": "🆔 My User ID", "callback_data": "user_id"},
-         {"text": "💎 Premium Status", "callback_data": "premium_status"}],
-        [{"text": "ℹ️ OTP Info", "callback_data": "otp_info"},
-         {"text": "📊 My Stats", "callback_data": "user_stats"}],
-        [{"text": "🎟️ Redeem License Key", "callback_data": "redeem_key"}],
+        [{"text": "📋 Overview", "callback_data": "overview"},
+         {"text": "⚙️ Settings", "callback_data": "settings"}],
+        [{"text": "🧰 Proxy Library", "callback_data": "proxy_library"},
+         {"text": "🎯 Hitters", "callback_data": "hitters"}],
+        [{"text": "🛠️ Tools", "callback_data": "tools"},
+         {"text": "👤 Accounts", "callback_data": "accounts"}],
+        [{"text": "📊 Stats", "callback_data": "user_stats"},
+         {"text": "📚 Tutorials", "callback_data": "tutorials"}],
+        [{"text": "💎 Premium Status", "callback_data": "premium_status"},
+         {"text": "🎟️ Redeem Key", "callback_data": "redeem_key"}],
         [{"text": "🔐 Request OTP", "callback_data": "request_otp"}],
+        [{"text": "🌐 Community", "callback_data": "community"}],
     ]
     
     if is_admin(chat_id):
@@ -374,6 +422,22 @@ def show_admin_panel(chat_id):
 
 def handle_callback(callback_id, from_id, msg_id, chat_id, data):
     user = get_user(chat_id)
+
+    info_cards = {
+        "overview": "📋 *Overview*\n\nUse the menu to manage your AR-V2 account, Premium access, OTP, and licenses.",
+        "settings": "⚙️ *Settings*\n\nAccount settings are managed with your Telegram identity and server-side authorization.",
+        "proxy_library": "🧰 *Proxy Library*\n\nProxy management is not enabled in the current AR-V2 server.",
+        "hitters": "🎯 *Hitters*\n\nUse the authenticated HTTP API for AR-V2 requests.",
+        "tools": "🛠️ *Tools*\n\nAvailable tools include OTP authentication, license redemption, and account statistics.",
+        "accounts": "👤 *Accounts*\n\nYour Telegram account is identified by the ID shown in the overview.",
+        "tutorials": "📚 *Tutorials*\n\nUse /register, then request Premium OTP access or redeem a license key.",
+        "community": "🌐 *Community*\n\nCommunity links are not configured for the current AR-V2 deployment.",
+    }
+    if data in info_cards:
+        edit_msg(chat_id, msg_id, info_cards[data],
+                 [[{"text": "← Back to Overview", "callback_data": "back_main"}]], parse_mode="Markdown")
+        answer_callback(callback_id)
+        return
 
     if data == "download_extension":
         edit_msg(chat_id, msg_id, "⬇️ *Download Extension*\n\nThe extension download will be available here soon.",
@@ -682,13 +746,16 @@ def telegram_poll():
             updates = telegram_call("getUpdates", {"limit": 100, "timeout": 10, "offset": OFFSET}) or []
             for update in updates:
                 OFFSET = update.get("update_id", 0) + 1
-                msg = update.get("message")
-                if msg:
-                    handle_message(msg)
-                callback = update.get("callback_query")
-                if callback:
-                    handle_callback(callback["id"], callback["from"]["id"], callback["message"]["message_id"],
-                                  callback["message"]["chat"]["id"], callback["data"])
+                try:
+                    msg = update.get("message")
+                    if msg:
+                        handle_message(msg)
+                    callback = update.get("callback_query")
+                    if callback:
+                        handle_callback(callback["id"], callback["from"]["id"], callback["message"]["message_id"],
+                                      callback["message"]["chat"]["id"], callback["data"])
+                except Exception as e:
+                    print(f"Update {update.get('update_id', '?')} failed: {e}")
         except Exception as e:
             print(f"Polling error: {e}")
             time.sleep(3)
