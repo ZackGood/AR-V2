@@ -1,4 +1,5 @@
 import json, os, secrets, sqlite3, threading, time, urllib.request, urllib.error, random
+from urllib.parse import urlparse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -69,6 +70,24 @@ def init_db():
             max_uses INTEGER NOT NULL, uses INTEGER DEFAULT 0, status TEXT DEFAULT 'active', created_by TEXT)""")
         conn.execute("""CREATE TABLE IF NOT EXISTS key_redemptions (
             id INTEGER PRIMARY KEY, key TEXT, telegram_id TEXT, redeemed_at INTEGER, premium_until INTEGER)""")
+        conn.execute("""CREATE TABLE IF NOT EXISTS settings (
+            name TEXT PRIMARY KEY, value TEXT NOT NULL DEFAULT '')""")
+        migrate_columns(conn, "users", {
+            "username": "TEXT DEFAULT ''", "first_name": "TEXT DEFAULT ''",
+            "plan": "TEXT DEFAULT 'free'", "premium_until": "INTEGER DEFAULT 0",
+            "registered_at": "INTEGER DEFAULT 0", "login_count": "INTEGER DEFAULT 0",
+            "revoked": "INTEGER DEFAULT 0", "active": "INTEGER DEFAULT 1"})
+        migrate_columns(conn, "admins", {
+            "username": "TEXT DEFAULT ''", "first_name": "TEXT DEFAULT ''",
+            "role": "TEXT DEFAULT 'admin'", "added_at": "INTEGER DEFAULT 0",
+            "added_by": "TEXT DEFAULT ''", "active": "INTEGER DEFAULT 1"})
+        migrate_columns(conn, "license_keys", {
+            "created_at": "INTEGER DEFAULT 0", "duration_days": "INTEGER DEFAULT 0",
+            "max_uses": "INTEGER DEFAULT 0", "uses": "INTEGER DEFAULT 0",
+            "status": "TEXT DEFAULT 'active'", "created_by": "TEXT DEFAULT ''"})
+        migrate_columns(conn, "key_redemptions", {
+            "key": "TEXT DEFAULT ''", "telegram_id": "TEXT DEFAULT ''",
+            "redeemed_at": "INTEGER DEFAULT 0", "premium_until": "INTEGER DEFAULT 0"})
         migrate_columns(conn, "users", {
             "telegram_id": "TEXT DEFAULT ''",
             "username": "TEXT DEFAULT ''", "first_name": "TEXT DEFAULT ''",
@@ -94,10 +113,23 @@ def init_db():
             "redeemed_at": "INTEGER DEFAULT 0", "premium_until": "INTEGER DEFAULT 0",
         })
         conn.commit()
+
+def get_setting(name, default=""):
+    with db() as conn:
+        row = conn.execute("SELECT value FROM settings WHERE name=?", (name,)).fetchone()
+    return row["value"] if row else default
+
+def set_setting(name, value):
+    with db() as conn:
+        conn.execute("INSERT OR REPLACE INTO settings(name, value) VALUES(?, ?)", (name, value))
+        conn.commit()
         owner = conn.execute("SELECT * FROM admins WHERE telegram_id=?", (str(OWNER_ID),)).fetchone()
         if not owner:
             conn.execute("INSERT INTO admins(telegram_id, role, added_at, added_by, active) VALUES(?,?,?,?,?)",
                         (str(OWNER_ID), "owner", int(time.time()), "system", 1))
+            conn.commit()
+        else:
+            conn.execute("UPDATE admins SET role='owner', active=1 WHERE telegram_id=?", (str(OWNER_ID),))
             conn.commit()
 
 def upsert_user(telegram_id, username="", first_name="", increment_login=False):
@@ -121,17 +153,37 @@ def get_user(telegram_id):
         return conn.execute("SELECT * FROM users WHERE telegram_id=?", (str(telegram_id),)).fetchone()
 
 def is_premium(user):
-    return user and user["premium_until"] and user["premium_until"] > int(time.time())
+    return bool(user and user["active"] and not user["revoked"] and
+                user["premium_until"] and user["premium_until"] > int(time.time()))
+
+def premium_error(user):
+    if not user:
+        return "You must register before requesting an OTP."
+    if user["revoked"] or not user["active"]:
+        return "Your account is inactive. Contact an administrator."
+    if user["premium_until"] and user["premium_until"] <= int(time.time()):
+        return "Premium has expired; redeem a license key."
+    return "Premium is required to request an OTP."
+
+def expire_premium(user):
+    if user and user["premium_until"] and user["premium_until"] <= int(time.time()) and user["plan"] != "free":
+        with db() as conn:
+            conn.execute("UPDATE users SET plan='free' WHERE telegram_id=?", (user["telegram_id"],))
+            conn.commit()
 
 def get_admin(telegram_id):
     with db() as conn:
         return conn.execute("SELECT * FROM admins WHERE telegram_id=?", (str(telegram_id),)).fetchone()
 
 def is_admin(telegram_id):
+    if str(telegram_id) == str(OWNER_ID):
+        return True
     admin = get_admin(telegram_id)
     return admin and admin["active"]
 
 def is_owner(telegram_id):
+    if str(telegram_id) == str(OWNER_ID):
+        return True
     admin = get_admin(telegram_id)
     return admin and admin["role"] == "owner"
 
@@ -154,12 +206,54 @@ def edit_msg(chat_id, msg_id, text, keyboard=None, **kw):
     if keyboard:
         payload["reply_markup"] = {"inline_keyboard": keyboard}
     payload.update(kw)
-    return telegram_call("editMessageText", payload)
+    try:
+        return telegram_call("editMessageText", payload)
+    except RuntimeError as error:
+        if "text" not in str(error).lower() and "caption" not in str(error).lower():
+            raise
+        payload["caption"] = payload.pop("text")[:1024]
+        return telegram_call("editMessageCaption", payload)
 
 def answer_callback(callback_id, text="", alert=False):
     telegram_call("answerCallbackQuery", {"callback_query_id": callback_id, "text": text, "show_alert": alert})
 
 def handle_command(chat_id, username, first_name, command, args):
+    if command == "/settings":
+        if not is_owner(chat_id):
+            send_msg(chat_id, "❌ Owner only")
+            return True
+        if len(args) != 2 or args[0] not in ("community_url", "required_chats", "welcome_text", "welcome_image", "join_gate"):
+            send_msg(chat_id, "Usage: /settings <community_url|required_chats|welcome_text|welcome_image|join_gate> <value>")
+            return True
+        name, value = args
+        if name == "join_gate" and value.lower() not in ("on", "off"):
+            send_msg(chat_id, "❌ join_gate must be on or off")
+            return True
+        if name in ("community_url", "welcome_image"):
+            parsed = urlparse(value)
+            if parsed.scheme not in ("http", "https") or not parsed.netloc:
+                send_msg(chat_id, "❌ Use a valid http(s) URL")
+                return True
+        if name == "required_chats":
+            if value.lower() in ("off", "clear", "none"):
+                value = ""
+            else:
+                for item in value.split(","):
+                    parts = item.split("|", 1)
+                    if not parts[0] or len(parts) != 2:
+                        send_msg(chat_id, "❌ Format: chat_id|https://join-url[,chat_id|https://join-url]")
+                        return True
+                    parsed = urlparse(parts[1])
+                    if parsed.scheme not in ("http", "https") or not parsed.netloc:
+                        send_msg(chat_id, "❌ Each required chat needs a valid join URL")
+                        return True
+        if name == "welcome_text" and len(value) > 500:
+            send_msg(chat_id, "❌ Welcome text is limited to 500 characters")
+            return True
+        set_setting(name, value)
+        send_msg(chat_id, f"✅ Setting updated: {name}")
+        return True
+
     if command == "/stats":
         user = get_user(chat_id)
         if not user:
@@ -171,10 +265,9 @@ def handle_command(chat_id, username, first_name, command, args):
 
     if command == "/otp":
         user = get_user(chat_id)
-        if not user:
-            send_msg(chat_id, "❌ Not registered. Use /register")
-        elif not is_premium(user):
-            send_msg(chat_id, "❌ Premium required!")
+        expire_premium(user)
+        if not is_premium(user):
+            send_msg(chat_id, f"❌ {premium_error(user)}")
         else:
             otp = f"{secrets.randbelow(1_000_000):06d}"
             OTPS[chat_id] = {"otp": otp, "expires": int(time.time()) + OTP_TTL, "attempts": 0}
@@ -198,9 +291,6 @@ def handle_command(chat_id, username, first_name, command, args):
             return True
 
     if command == "/key":
-        if not is_owner(chat_id):
-            send_msg(chat_id, "❌ Owner only")
-            return True
         if len(args) not in (1, 2):
             send_msg(chat_id, "Usage: /key <days> [uses]")
             return True
@@ -347,29 +437,56 @@ def get_user_state(user_id):
 def set_user_state(user_id, **kw):
     USER_STATE[str(user_id)] = {**get_user_state(user_id), **kw}
 
-def show_user_panel(chat_id):
+def required_chats():
+    result = []
+    for item in get_setting("required_chats").split(","):
+        item = item.strip()
+        if item:
+            parts = item.split("|", 1)
+            result.append((parts[0], parts[1] if len(parts) == 2 else ""))
+    return result
+
+def has_required_membership(chat_id):
+    if str(chat_id) == str(OWNER_ID):
+        return True
+    for required_id, _ in required_chats():
+        member = telegram_call("getChatMember", {"chat_id": required_id, "user_id": chat_id})
+        if member.get("status") not in ("creator", "administrator", "member"):
+            return False
+    return True
+
+def membership_panel(chat_id):
+    keyboard = []
+    for _, url in required_chats():
+        if url:
+            keyboard.append([{"text": "Join required channel", "url": url}])
+    keyboard.append([{"text": "✅ Verify membership", "callback_data": "verify_membership"}])
+    send_msg(chat_id, "Please join the required channels, then tap Verify membership.", keyboard)
+
+def show_user_panel(chat_id, msg_id=None):
     user = get_user(chat_id)
     if not user:
-        send_msg(chat_id, "❌ Not registered. Use /register", parse_mode="Markdown")
+        text = "❌ Not registered. Use /register"
+        if msg_id:
+            edit_msg(chat_id, msg_id, text)
+        else:
+            send_msg(chat_id, text)
         return
     
+    expire_premium(user)
+    user = get_user(chat_id)
     is_prem = is_premium(user)
     plan = "Premium" if is_prem else "Free"
     display_name = user["first_name"] or user["username"] or "User"
-    text = (
-        f"🤖 *AR-V2 Control Panel*\n"
-        f"👋 Welcome, {display_name}!\n\n"
-        "*Information*\n"
-        "• Bot Version: AR-V2\n"
-        "• Operator: AR-V2 Operations\n"
-        "• Authorized Users: Telegram ID access\n"
-        "• Premium Users: Premium plan access\n\n"
-        "*Capabilities*\n"
-        "• Hitters: HTTP request API\n"
-        "• Checkers: OTP verification\n"
-        "• Tools: License and account management\n\n"
-        f"🆔 Telegram ID: `{user['telegram_id']}`\n💎 Plan: *{plan}*"
-    )
+    text = (f"🤖 *AR-V2*\n👋 Welcome, {display_name}!\n\n"
+            "*Information*\n• Bot Version: AR-V2\n• Operator: AR-V2 Operations\n"
+            "• Authorized Users: Telegram ID access\n• Premium Users: Premium plan access\n\n"
+            "*Capabilities*\n• Hitters: HTTP request API\n• Checkers: OTP verification\n"
+            "• Tools: License and account management\n\n"
+            f"🆔 Telegram ID: `{user['telegram_id']}`\n💎 Plan: *{plan}*")
+    custom_welcome = get_setting("welcome_text")
+    if custom_welcome:
+        text = f"{custom_welcome}\n\n{text}"
     if is_prem:
         expires = time.strftime("%Y-%m-%d %H:%M", time.localtime(user["premium_until"]))
         text += f"\n✅ Status: Active\n⏰ Expires: {expires}"
@@ -377,30 +494,34 @@ def show_user_panel(chat_id):
         text += "\nℹ️ Status: Free"
     
     keyboard = [
-        [{"text": "📋 Overview", "callback_data": "overview"},
-         {"text": "⚙️ Settings", "callback_data": "settings"}],
-        [{"text": "🧰 Proxy Library", "callback_data": "proxy_library"},
-         {"text": "🎯 Hitters", "callback_data": "hitters"}],
-        [{"text": "🛠️ Tools", "callback_data": "tools"},
-         {"text": "👤 Accounts", "callback_data": "accounts"}],
-        [{"text": "📊 Stats", "callback_data": "user_stats"},
-         {"text": "📚 Tutorials", "callback_data": "tutorials"}],
-        [{"text": "💎 Premium Status", "callback_data": "premium_status"},
-         {"text": "🎟️ Redeem Key", "callback_data": "redeem_key"}],
-        [{"text": "🔐 Request OTP", "callback_data": "request_otp"}],
-        [{"text": "🌐 Community", "callback_data": "community"}],
+        [{"text": "📋 Overview", "callback_data": "overview"}],
+        [{"text": "🆔 My User ID", "callback_data": "user_id"},
+         {"text": "💎 Premium Status", "callback_data": "premium_status"}],
+        [{"text": "ℹ️ OTP Info", "callback_data": "otp_info"},
+         {"text": "📊 My Stats", "callback_data": "user_stats"}],
+        [{"text": "🎟️ Redeem Key", "callback_data": "redeem_key"},
+         {"text": "🔐 Request OTP", "callback_data": "request_otp"}],
     ]
+    community = get_setting("community_url")
+    if community:
+        keyboard.append([{"text": "🌐 Community", "url": community}])
     
     if is_admin(chat_id):
         keyboard.append([{"text": "🛠️ Admin Panel", "callback_data": "admin_panel"}])
+    if is_owner(chat_id):
+        keyboard[0].append({"text": "⚙️ Settings", "callback_data": "settings"})
     
     try:
-        send_msg(chat_id, text, keyboard, photo=random.choice(WELCOME_IMAGES), parse_mode="Markdown")
+        if msg_id:
+            edit_msg(chat_id, msg_id, text, keyboard, parse_mode="Markdown")
+            return
+        image = get_setting("welcome_image") or WELCOME_IMAGES[0]
+        send_msg(chat_id, text, keyboard, photo=image, parse_mode="Markdown")
     except Exception as error:
         print(f"Welcome photo failed: {error}")
         send_msg(chat_id, text, keyboard, parse_mode="Markdown")
 
-def show_admin_panel(chat_id):
+def show_admin_panel(chat_id, msg_id=None):
     if not is_admin(chat_id):
         send_msg(chat_id, "❌ Unauthorized", parse_mode="Markdown")
         return
@@ -418,20 +539,51 @@ def show_admin_panel(chat_id):
             [{"text": "⭐ Give Premium", "callback_data": "admin_giveprem"}],
         ])
     
-    send_msg(chat_id, text, keyboard, parse_mode="Markdown")
+    if msg_id:
+        edit_msg(chat_id, msg_id, text, keyboard, parse_mode="Markdown")
+    else:
+        send_msg(chat_id, text, keyboard, parse_mode="Markdown")
 
 def handle_callback(callback_id, from_id, msg_id, chat_id, data):
     user = get_user(chat_id)
 
+    if data == "verify_membership":
+        if not has_required_membership(chat_id):
+            answer_callback(callback_id, "Join all required channels first.", alert=True)
+            return
+        if not user:
+            upsert_user(chat_id)
+        show_user_panel(chat_id, msg_id)
+        answer_callback(callback_id, "Membership verified")
+        return
+
+    if data == "settings":
+        if not is_owner(from_id):
+            answer_callback(callback_id, "❌ Owner only", alert=True)
+            return
+        gate = "ON" if get_setting("join_gate") == "on" else "OFF"
+        edit_msg(chat_id, msg_id, "⚙️ *Owner Settings*\n\n"
+                 "Use `/settings name value` to update persistent settings.\n"
+                 f"Required-channel gate: *{gate}*\n"
+                 "Supported: community_url, required_chats, welcome_text, welcome_image, join_gate",
+                 [[{"text": "Enable Join Gate", "callback_data": "settings_gate_on"},
+                   {"text": "Disable Join Gate", "callback_data": "settings_gate_off"}],
+                  [{"text": "← Back", "callback_data": "back_main"}]], parse_mode="Markdown")
+        answer_callback(callback_id)
+        return
+
+    if data in ("settings_gate_on", "settings_gate_off"):
+        if not is_owner(from_id):
+            answer_callback(callback_id, "❌ Owner only", alert=True)
+            return
+        set_setting("join_gate", "on" if data.endswith("_on") else "off")
+        edit_msg(chat_id, msg_id, "✅ Required-channel gate updated.",
+                 [[{"text": "← Back", "callback_data": "back_main"}]], parse_mode="Markdown")
+        answer_callback(callback_id)
+        return
+
     info_cards = {
         "overview": "📋 *Overview*\n\nUse the menu to manage your AR-V2 account, Premium access, OTP, and licenses.",
-        "settings": "⚙️ *Settings*\n\nAccount settings are managed with your Telegram identity and server-side authorization.",
-        "proxy_library": "🧰 *Proxy Library*\n\nProxy management is not enabled in the current AR-V2 server.",
-        "hitters": "🎯 *Hitters*\n\nUse the authenticated HTTP API for AR-V2 requests.",
-        "tools": "🛠️ *Tools*\n\nAvailable tools include OTP authentication, license redemption, and account statistics.",
-        "accounts": "👤 *Accounts*\n\nYour Telegram account is identified by the ID shown in the overview.",
-        "tutorials": "📚 *Tutorials*\n\nUse /register, then request Premium OTP access or redeem a license key.",
-        "community": "🌐 *Community*\n\nCommunity links are not configured for the current AR-V2 deployment.",
     }
     if data in info_cards:
         edit_msg(chat_id, msg_id, info_cards[data],
@@ -458,18 +610,22 @@ def handle_callback(callback_id, from_id, msg_id, chat_id, data):
         if not user:
             answer_callback(callback_id, "Not registered", alert=True)
             return
+        expire_premium(user)
+        user = get_user(chat_id)
         if is_premium(user):
             expires = time.strftime("%Y-%m-%d %H:%M", time.localtime(user["premium_until"]))
             text = f"💎 *Premium Status*\n\n✅ Active\n⏰ Expires: {expires}"
         else:
-            text = "💎 *Premium Status*\n\nℹ️ You are on the Free plan."
+            text = "💎 *Premium Status*\n\nℹ️ You are on the Free plan.\n"
+            if user["premium_until"]:
+                text += "Premium has expired; OTP access is disabled until you redeem a license key."
         edit_msg(chat_id, msg_id, text, [[{"text": "← Back", "callback_data": "back_main"}]], parse_mode="Markdown")
         answer_callback(callback_id)
         return
 
     if data == "otp_info":
         edit_msg(chat_id, msg_id, "ℹ️ *OTP Info*\n\nOTP access requires an active Premium plan. "
-                 "Codes are valid for 5 minutes.",
+                 "Codes are valid for 5 minutes. After Premium expires, redeem a license key to restore access.",
                  [[{"text": "← Back", "callback_data": "back_main"}]], parse_mode="Markdown")
         answer_callback(callback_id)
         return
@@ -490,11 +646,9 @@ def handle_callback(callback_id, from_id, msg_id, chat_id, data):
         return
     
     if data == "request_otp":
-        if not user:
-            answer_callback(callback_id, "Not registered", alert=True)
-            return
+        expire_premium(user)
         if not is_premium(user):
-            answer_callback(callback_id, "❌ Premium required!", alert=True)
+            answer_callback(callback_id, premium_error(user), alert=True)
             return
         otp = f"{secrets.randbelow(1_000_000):06d}"
         now = int(time.time())
@@ -508,7 +662,7 @@ def handle_callback(callback_id, from_id, msg_id, chat_id, data):
         if not is_admin(chat_id):
             answer_callback(callback_id, "❌ Unauthorized", alert=True)
             return
-        show_admin_panel(chat_id)
+        show_admin_panel(chat_id, msg_id)
         answer_callback(callback_id)
         return
     
@@ -590,8 +744,8 @@ def handle_callback(callback_id, from_id, msg_id, chat_id, data):
         return
     
     if data == "admin_genkey":
-        if not is_owner(chat_id):
-            answer_callback(callback_id, "❌ Owner only", alert=True)
+        if not is_admin(chat_id):
+            answer_callback(callback_id, "❌ Unauthorized", alert=True)
             return
         send_msg(chat_id, "🔑 Send key format: <days> <uses>\nExample: 30 1")
         set_user_state(chat_id, action="genkey")
@@ -608,7 +762,7 @@ def handle_callback(callback_id, from_id, msg_id, chat_id, data):
         return
     
     if data == "back_main":
-        show_user_panel(chat_id)
+        show_user_panel(chat_id, msg_id)
         answer_callback(callback_id)
         return
     
@@ -629,14 +783,24 @@ def handle_message(msg):
         command_parts = text.split()
         command = command_parts[0].split("@", 1)[0].lower()
         if command == "/start":
+            if get_setting("join_gate") == "on" and required_chats() and not has_required_membership(chat_id):
+                membership_panel(chat_id)
+                return
             upsert_user(chat_id, username, first_name)
             show_user_panel(chat_id)
             return
         if command == "/register":
+            if get_setting("join_gate") == "on" and required_chats() and not has_required_membership(chat_id):
+                membership_panel(chat_id)
+                return
             upsert_user(chat_id, username, first_name)
-            send_msg(chat_id, "✅ Registered as Free. Use /start to continue.")
+            show_user_panel(chat_id)
             return
-        if handle_command(chat_id, username, first_name, command, command_parts[1:]):
+        command_args = command_parts[1:]
+        if command == "/settings":
+            setting_parts = text.split(" ", 2)
+            command_args = setting_parts[1:] if len(setting_parts) > 1 else []
+        if handle_command(chat_id, username, first_name, command, command_args):
             return
     
     state = get_user_state(chat_id)
@@ -658,15 +822,6 @@ def handle_message(msg):
             if not k:
                 send_msg(chat_id, "❌ Invalid key")
                 return
-            if k["status"] != "active":
-                send_msg(chat_id, f"❌ Key is {k['status']}")
-                return
-            if k["uses"] >= k["max_uses"]:
-                conn.execute("UPDATE license_keys SET status='exhausted' WHERE key=?", (key,))
-                conn.commit()
-                send_msg(chat_id, "❌ Key exhausted")
-                return
-            
             existing = conn.execute("SELECT * FROM key_redemptions WHERE key=? AND telegram_id=?", (key, chat_id)).fetchone()
             if existing:
                 send_msg(chat_id, "❌ Already redeemed this key")
@@ -676,9 +831,14 @@ def handle_message(msg):
             current_prem = user["premium_until"] if user["premium_until"] else now
             new_prem = max(current_prem, now) + (k["duration_days"] * 86400)
             
+            updated = conn.execute(
+                "UPDATE license_keys SET uses=uses+1, status=CASE WHEN uses+1 >= max_uses THEN 'exhausted' ELSE status END "
+                "WHERE key=? AND status='active' AND uses < max_uses", (key,))
+            if not updated.rowcount:
+                send_msg(chat_id, "❌ Key is invalid, revoked, or exhausted")
+                return
             conn.execute("INSERT INTO key_redemptions(key, telegram_id, redeemed_at, premium_until) VALUES(?,?,?,?)",
-                        (key, chat_id, now, new_prem))
-            conn.execute("UPDATE license_keys SET uses=uses+1 WHERE key=?", (key,))
+                         (key, chat_id, now, new_prem))
             conn.execute("UPDATE users SET plan='premium', premium_until=? WHERE telegram_id=?", (new_prem, chat_id))
             conn.commit()
         
@@ -793,11 +953,12 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/request-otp":
             user_id = str(data.get("userId", "")).strip()
             user = get_user(user_id)
-            if not user or not is_premium(user):
+            expire_premium(user)
+            if not is_premium(user):
                 self.send_response(403)
                 self.send_header("Content-Type", "application/json")
                 self.end_headers()
-                self.wfile.write(b'{"success":false,"error":"Premium required"}')
+                self.wfile.write(json.dumps({"success": False, "error": premium_error(user)}).encode())
                 return
             otp = f"{secrets.randbelow(1_000_000):06d}"
             now = int(time.time())
@@ -817,7 +978,9 @@ class Handler(BaseHTTPRequestHandler):
             otp = str(data.get("otp", "")).strip()
             record = OTPS.get(user_id)
             now = int(time.time())
-            if not record or record["expires"] < now or otp != record["otp"]:
+            if not record or record["expires"] <= now or otp != record["otp"]:
+                if record and record["expires"] <= now:
+                    OTPS.pop(user_id, None)
                 self.send_response(401)
                 self.send_header("Content-Type", "application/json")
                 self.end_headers()
@@ -825,14 +988,15 @@ class Handler(BaseHTTPRequestHandler):
                 return
             OTPS.pop(user_id, None)
             user = get_user(user_id)
+            expire_premium(user)
             if not is_premium(user):
                 self.send_response(403)
                 self.send_header("Content-Type", "application/json")
                 self.end_headers()
-                self.wfile.write(b'{"success":false,"error":"Premium expired"}')
+                self.wfile.write(json.dumps({"success": False, "error": premium_error(user)}).encode())
                 return
             session = secrets.token_urlsafe(18)
-            SESSIONS[session] = {"user_id": user_id, "expires": now + SESSION_TTL}
+            SESSIONS[session] = {"user_id": user_id, "expires_at": now + SESSION_TTL}
             upsert_user(user_id, user["username"], user["first_name"], increment_login=True)
             user = get_user(user_id)
             self.send_response(200)
@@ -846,7 +1010,11 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/validate-token":
             token = str(data.get("token", "")).strip()
             record = SESSIONS.get(token)
-            if not record or record["expires"] < int(time.time()):
+            now = int(time.time())
+            token_user = get_user(record["user_id"]) if record else None
+            if not record or record["expires_at"] <= now or not token_user or not token_user["active"] or token_user["revoked"]:
+                if record and record["expires_at"] <= now:
+                    SESSIONS.pop(token, None)
                 self.send_response(401)
                 self.send_header("Content-Type", "application/json")
                 self.end_headers()
