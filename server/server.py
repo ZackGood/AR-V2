@@ -61,7 +61,8 @@ def init_db():
         conn.execute("""CREATE TABLE IF NOT EXISTS users (
             telegram_id TEXT PRIMARY KEY, username TEXT DEFAULT '', first_name TEXT DEFAULT '',
             plan TEXT DEFAULT 'free', premium_until INTEGER DEFAULT 0, registered_at INTEGER NOT NULL,
-            login_count INTEGER DEFAULT 0, revoked INTEGER DEFAULT 0, active INTEGER DEFAULT 1)""")
+            login_count INTEGER DEFAULT 0, last_verified_at INTEGER DEFAULT 0,
+            revoked INTEGER DEFAULT 0, active INTEGER DEFAULT 1)""")
         conn.execute("""CREATE TABLE IF NOT EXISTS admins (
             telegram_id TEXT PRIMARY KEY, username TEXT DEFAULT '', first_name TEXT DEFAULT '',
             display_name TEXT DEFAULT 'Admin', role TEXT DEFAULT 'admin',
@@ -77,6 +78,7 @@ def init_db():
             "username": "TEXT DEFAULT ''", "first_name": "TEXT DEFAULT ''",
             "plan": "TEXT DEFAULT 'free'", "premium_until": "INTEGER DEFAULT 0",
             "registered_at": "INTEGER DEFAULT 0", "login_count": "INTEGER DEFAULT 0",
+            "last_verified_at": "INTEGER DEFAULT 0",
             "revoked": "INTEGER DEFAULT 0", "active": "INTEGER DEFAULT 1"})
         migrate_columns(conn, "admins", {
             "username": "TEXT DEFAULT ''", "first_name": "TEXT DEFAULT ''",
@@ -95,6 +97,7 @@ def init_db():
             "username": "TEXT DEFAULT ''", "first_name": "TEXT DEFAULT ''",
             "plan": "TEXT DEFAULT 'free'", "premium_until": "INTEGER DEFAULT 0",
             "registered_at": "INTEGER DEFAULT 0", "login_count": "INTEGER DEFAULT 0",
+            "last_verified_at": "INTEGER DEFAULT 0",
             "revoked": "INTEGER DEFAULT 0", "active": "INTEGER DEFAULT 1",
         })
         migrate_columns(conn, "admins", {
@@ -174,6 +177,38 @@ def premium_error(user):
         return "Your account is inactive. Contact an administrator."
     return "Premium access is required for OTP. Contact @ZackZ10 or @kiora_AR to purchase/activate Premium."
 
+def owner_otp_blocked():
+    return "OTP access is not available for the owner account."
+
+def notify_authentication(user, user_id, expires_at):
+    if str(user_id) == str(OWNER_ID):
+        return
+    display_name = user["first_name"] or user["username"] or "User"
+    username = f" (@{user['username']})" if user["username"] else ""
+    premium_status = "Premium active" if is_premium(user) else "Premium inactive"
+    role = display_role(user_id)
+    plan = "Premium" if is_premium(user) else "Free"
+    timestamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+    remaining = premium_remaining(expires_at)
+    message = (f"User authenticated / logged in\n"
+               f"User: {display_name}{username}\n"
+               f"Telegram ID: {user_id}\n"
+               f"Role: {role}\n"
+               f"Plan: {plan}\n"
+               f"Premium status: {premium_status}\n"
+               f"Timestamp: {timestamp}\n"
+               f"Session remaining: {remaining}")
+    try:
+        send_msg(OWNER_ID, message)
+    except Exception as error:
+        print(f"Authentication notification failed: {error}")
+
+def notify_user_authenticated(user_id, expires_at):
+    try:
+        send_msg(user_id, f"✅ Logged in successfully. Session remaining: {premium_remaining(expires_at)}.")
+    except Exception as error:
+        print(f"User authentication confirmation failed: {error}")
+
 def expire_premium(user):
     if user and user["premium_until"] and user["premium_until"] <= int(time.time()) and user["plan"] != "free":
         with db() as conn:
@@ -220,11 +255,21 @@ def format_user_record(user):
     plan = "Premium" if is_premium(user) else "Free"
     status = "Active" if user["active"] and not user["revoked"] else "Revoked"
     text = (f"`{user['telegram_id']}` | @{user['username'] or 'No username'}\n"
-            f"Role: {display_role(user['telegram_id'])} | Plan: {plan} | Status: {status}\n")
-    if is_premium(user):
+            f"Name: {user['first_name'] or 'No name'}\n"
+            f"Role: {display_role(user['telegram_id'])} | Plan: {plan} | Status: {status}\n"
+            f"Premium: {'Active' if is_premium(user) else ('Expired' if user['premium_until'] else 'Inactive')}\n"
+            f"Registered: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(user['registered_at']))}\n"
+            f"Logins: {user['login_count']}\n")
+    if user["premium_until"]:
         expires = time.strftime("%Y-%m-%d %H:%M", time.localtime(user["premium_until"]))
-        text += f"Premium until: {expires} ({premium_remaining(user['premium_until'])})\n"
+        remaining = premium_remaining(user["premium_until"]) if is_premium(user) else "expired"
+        text += f"Premium until: {expires} ({remaining})\n"
+    if "last_verified_at" in user.keys() and user["last_verified_at"]:
+        text += f"Last verified: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(user['last_verified_at']))}\n"
     return text
+
+def is_listed_user(user):
+    return bool(user["premium_until"] or display_role(user["telegram_id"]) != "User")
 
 def format_user_info(user):
     if not user:
@@ -337,7 +382,9 @@ def handle_command(chat_id, username, first_name, command, args):
     if command == "/otp":
         user = get_user(chat_id)
         expire_premium(user)
-        if not is_premium(user):
+        if str(chat_id) == str(OWNER_ID):
+            send_msg(chat_id, owner_otp_blocked())
+        elif not is_premium(user):
             send_msg(chat_id, f"❌ {premium_error(user)}")
         else:
             otp = f"{secrets.randbelow(1_000_000):06d}"
@@ -403,7 +450,8 @@ def handle_command(chat_id, username, first_name, command, args):
 
     if command == "/users":
         with db() as conn:
-            users = conn.execute("SELECT * FROM users ORDER BY registered_at DESC").fetchall()
+            all_users = conn.execute("SELECT * FROM users ORDER BY registered_at DESC").fetchall()
+        users = [user for user in all_users if is_listed_user(user)]
         text = "👥 *Users*\n\n" + "".join(format_user_record(user) for user in users)
         send_msg(chat_id, text if users else "👥 No users", parse_mode="Markdown")
         return True
@@ -564,7 +612,7 @@ def show_user_panel(chat_id, msg_id=None):
     user = get_user(chat_id)
     is_prem = is_premium(user)
     display_name = user["first_name"] or user["username"] or "User"
-    text = (f"👋 *Welcome, {display_name}!*\n\n"
+    text = ("👋 *Welcome to AR Hitter*\n\n"
             f"💎 Plan: *{'Premium' if is_prem else 'Free'}*\n"
             f"🛡️ Role: *{display_role(chat_id)}*")
     custom_welcome = get_setting("welcome_text")
@@ -579,7 +627,7 @@ def show_user_panel(chat_id, msg_id=None):
     
     keyboard = [
         [{"text": "💎 Premium Status", "callback_data": "premium_status"}],
-        [{"text": "ℹ️ OTP Info", "callback_data": "otp_info"},
+        [{"text": "🔐 OTP Access", "callback_data": "otp_access"},
          {"text": "📊 My Stats", "callback_data": "user_stats"}],
         [{"text": "🎟️ Redeem Key", "callback_data": "redeem_key"},
          {"text": "🔐 Request OTP", "callback_data": "request_otp"}],
@@ -672,19 +720,31 @@ def handle_callback(callback_id, from_id, msg_id, chat_id, data):
         else:
             text = "💎 *Premium Status*\n\n"
             if user["premium_until"]:
-                text += "⚠️ Premium expired.\nOTP is blocked.\n"
+                expires = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(user["premium_until"]))
+                text += f"⚠️ Free / Inactive.\nPremium expired.\n⏰ Expired: {expires}\n⏳ Remaining: expired\nOTP is blocked.\n"
             else:
-                text += "ℹ️ Free / Inactive.\n"
+                text += "ℹ️ Free / Inactive.\n⏰ Premium until: Not set\n⏳ Remaining: 0\n"
             text += "Premium access is required for OTP. Contact @ZackZ10 or @kiora_AR to purchase/activate Premium."
             text += f"\n🛡️ Role: {display_role(chat_id)}"
         edit_msg(chat_id, msg_id, text, [[{"text": "← Back", "callback_data": "back_main"}]], parse_mode="Markdown")
         answer_callback(callback_id)
         return
 
-    if data == "otp_info":
-        edit_msg(chat_id, msg_id, "ℹ️ *OTP Info*\n\nPremium is required. Each OTP is valid for 5 minutes "
-                 "and can be used once. A successful verification creates a 24-hour session.",
-                 [[{"text": "← Back", "callback_data": "back_main"}]], parse_mode="Markdown")
+    if data in ("otp_info", "otp_access"):
+        expire_premium(user)
+        user = get_user(chat_id)
+        if is_premium(user):
+            text = ("🔐 *OTP Access*\n\nPremium is required.\n"
+                    "OTP validity: 5 minutes, single-use.\n"
+                    "Successful verification creates a 24-hour session.")
+            keyboard = [[{"text": "Request OTP", "callback_data": "request_otp"}],
+                        [{"text": "← Back", "callback_data": "back_main"}]]
+        else:
+            text = (f"🔐 *OTP Access*\n\n{premium_error(user)}\n"
+                    "OTP validity: 5 minutes, single-use.\n"
+                    "Successful verification creates a 24-hour session.")
+            keyboard = [[{"text": "← Back", "callback_data": "back_main"}]]
+        edit_msg(chat_id, msg_id, text, keyboard, parse_mode="Markdown")
         answer_callback(callback_id)
         return
     
@@ -705,6 +765,9 @@ def handle_callback(callback_id, from_id, msg_id, chat_id, data):
     
     if data == "request_otp":
         expire_premium(user)
+        if str(chat_id) == str(OWNER_ID):
+            answer_callback(callback_id, owner_otp_blocked(), alert=True)
+            return
         if not is_premium(user):
             answer_callback(callback_id, premium_error(user), alert=True)
             return
@@ -729,12 +792,17 @@ def handle_callback(callback_id, from_id, msg_id, chat_id, data):
         if not is_admin(chat_id):
             answer_callback(callback_id, "❌ Unauthorized", alert=True)
             return
-        page = int(data.split("_")[2])
+        try:
+            page = max(0, int(data.split("_")[2]))
+        except (IndexError, ValueError):
+            answer_callback(callback_id, "Invalid users page", alert=True)
+            return
         with db() as conn:
             all_users = conn.execute("SELECT * FROM users ORDER BY registered_at DESC").fetchall()
+        all_users = [user for user in all_users if is_listed_user(user)]
         total = len(all_users)
         per_page = 5
-        pages = (total + per_page - 1) // per_page
+        pages = max(1, (total + per_page - 1) // per_page)
         start = page * per_page
         users_page = all_users[start:start + per_page]
         text = f"👥 *Users* (Page {page + 1}/{pages})\n\n"
@@ -746,7 +814,7 @@ def handle_callback(callback_id, from_id, msg_id, chat_id, data):
         if page < pages - 1:
             keyboard.append({"text": "Next →", "callback_data": f"admin_users_{page+1}"})
         keyboard.append({"text": "🔙 Main", "callback_data": "back_main"})
-        edit_msg(chat_id, msg_id, text, [keyboard], parse_mode="Markdown")
+        edit_msg(chat_id, msg_id, text, keyboard, parse_mode="Markdown")
         answer_callback(callback_id)
         return
     
@@ -1017,6 +1085,12 @@ class Handler(BaseHTTPRequestHandler):
             user_id = str(data.get("userId", "")).strip()
             user = get_user(user_id)
             expire_premium(user)
+            if user_id == str(OWNER_ID):
+                self.send_response(403)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(json.dumps({"success": False, "error": owner_otp_blocked()}).encode())
+                return
             if not is_premium(user):
                 self.send_response(403)
                 self.send_header("Content-Type", "application/json")
@@ -1039,6 +1113,12 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/verify-otp":
             user_id = str(data.get("userId", "")).strip()
             otp = str(data.get("otp", "")).strip()
+            if user_id == str(OWNER_ID):
+                self.send_response(403)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(json.dumps({"success": False, "error": owner_otp_blocked()}).encode())
+                return
             record = OTPS.get(user_id)
             now = int(time.time())
             if not record or record["expires"] <= now or otp != record["otp"]:
@@ -1061,7 +1141,14 @@ class Handler(BaseHTTPRequestHandler):
             session = secrets.token_urlsafe(18)
             SESSIONS[session] = {"user_id": user_id, "expires_at": now + SESSION_TTL}
             upsert_user(user_id, user["username"], user["first_name"], increment_login=True)
+            with db() as conn:
+                conn.execute("UPDATE users SET last_verified_at=? WHERE telegram_id=?",
+                             (now, user_id))
+                conn.commit()
             user = get_user(user_id)
+            expires_at = SESSIONS[session]["expires_at"]
+            notify_user_authenticated(user_id, expires_at)
+            notify_authentication(user, user_id, expires_at)
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.end_headers()
