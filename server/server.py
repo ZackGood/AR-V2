@@ -325,23 +325,32 @@ def show_user_panel(chat_id):
     
     is_prem = is_premium(user)
     plan = "Premium" if is_prem else "Free"
-    status = "Active" if is_prem else "Inactive"
-    
-    text = f"👤 *Account Panel*\n\n🆔 ID: `{user['telegram_id']}`\n@{user['username'] or 'no_user'}\nPlan: *{plan}*\nStatus: {status}"
+    display_name = user["first_name"] or user["username"] or "User"
+    text = f"👋 *Welcome, {display_name}!*\n\n🆔 Telegram ID: `{user['telegram_id']}`\n💎 Plan: *{plan}*"
     if is_prem:
         expires = time.strftime("%Y-%m-%d %H:%M", time.localtime(user["premium_until"]))
-        text += f"\n⏰ Expires: {expires}"
+        text += f"\n✅ Status: Active\n⏰ Expires: {expires}"
+    else:
+        text += "\nℹ️ Status: Free"
     
     keyboard = [
-        [{"text": "📊 My Stats", "callback_data": "user_stats"}],
-        [{"text": "🎟️ Redeem Key", "callback_data": "redeem_key"}],
+        [{"text": "⬇️ Download Extension", "callback_data": "download_extension"}],
+        [{"text": "🆔 My User ID", "callback_data": "user_id"},
+         {"text": "💎 Premium Status", "callback_data": "premium_status"}],
+        [{"text": "ℹ️ OTP Info", "callback_data": "otp_info"},
+         {"text": "📊 My Stats", "callback_data": "user_stats"}],
+        [{"text": "🎟️ Redeem License Key", "callback_data": "redeem_key"}],
         [{"text": "🔐 Request OTP", "callback_data": "request_otp"}],
     ]
     
     if is_admin(chat_id):
         keyboard.append([{"text": "🛠️ Admin Panel", "callback_data": "admin_panel"}])
     
-    send_msg(chat_id, text, keyboard, photo=random.choice(WELCOME_IMAGES), parse_mode="Markdown")
+    try:
+        send_msg(chat_id, text, keyboard, photo=random.choice(WELCOME_IMAGES), parse_mode="Markdown")
+    except Exception as error:
+        print(f"Welcome photo failed: {error}")
+        send_msg(chat_id, text, keyboard, parse_mode="Markdown")
 
 def show_admin_panel(chat_id):
     if not is_admin(chat_id):
@@ -365,6 +374,41 @@ def show_admin_panel(chat_id):
 
 def handle_callback(callback_id, from_id, msg_id, chat_id, data):
     user = get_user(chat_id)
+
+    if data == "download_extension":
+        edit_msg(chat_id, msg_id, "⬇️ *Download Extension*\n\nThe extension download will be available here soon.",
+                 [[{"text": "← Back", "callback_data": "back_main"}]], parse_mode="Markdown")
+        answer_callback(callback_id)
+        return
+
+    if data == "user_id":
+        if not user:
+            answer_callback(callback_id, "Not registered", alert=True)
+            return
+        edit_msg(chat_id, msg_id, f"🆔 *Your Telegram ID*\n\n`{user['telegram_id']}`",
+                 [[{"text": "← Back", "callback_data": "back_main"}]], parse_mode="Markdown")
+        answer_callback(callback_id)
+        return
+
+    if data == "premium_status":
+        if not user:
+            answer_callback(callback_id, "Not registered", alert=True)
+            return
+        if is_premium(user):
+            expires = time.strftime("%Y-%m-%d %H:%M", time.localtime(user["premium_until"]))
+            text = f"💎 *Premium Status*\n\n✅ Active\n⏰ Expires: {expires}"
+        else:
+            text = "💎 *Premium Status*\n\nℹ️ You are on the Free plan."
+        edit_msg(chat_id, msg_id, text, [[{"text": "← Back", "callback_data": "back_main"}]], parse_mode="Markdown")
+        answer_callback(callback_id)
+        return
+
+    if data == "otp_info":
+        edit_msg(chat_id, msg_id, "ℹ️ *OTP Info*\n\nOTP access requires an active Premium plan. "
+                 "Codes are valid for 5 minutes.",
+                 [[{"text": "← Back", "callback_data": "back_main"}]], parse_mode="Markdown")
+        answer_callback(callback_id)
+        return
     
     if data == "user_stats":
         if not user:
