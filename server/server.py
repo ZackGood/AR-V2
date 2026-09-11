@@ -656,6 +656,7 @@ def show_admin_panel(chat_id, msg_id=None):
     
     text = "🛠️ *Admin Panel*"
     keyboard = [
+        [{"text": "👥 List Users", "callback_data": "admin_users_0"}],
         [{"text": "🔑 Generate Key", "callback_data": "admin_genkey"}],
         [{"text": "🗝️ List Keys", "callback_data": "admin_keys_0"}],
     ]
@@ -748,7 +749,37 @@ def handle_callback(callback_id, from_id, msg_id, chat_id, data):
         show_admin_panel(chat_id, msg_id)
         answer_callback(callback_id)
         return
-    
+
+    if data.startswith("admin_users_"):
+        if not is_admin(chat_id):
+            answer_callback(callback_id, "❌ Unauthorized", alert=True)
+            return
+        try:
+            page = max(0, int(data.split("_")[2]))
+        except (IndexError, ValueError):
+            answer_callback(callback_id, "Invalid users page", alert=True)
+            return
+        with db() as conn:
+            all_users = conn.execute("SELECT * FROM users ORDER BY registered_at DESC").fetchall()
+        listed_users = [item for item in all_users if is_listed_user(item)]
+        per_page = 5
+        pages = max(1, (len(listed_users) + per_page - 1) // per_page)
+        page = min(page, pages - 1)
+        users_page = listed_users[page * per_page:(page + 1) * per_page]
+        text = f"👥 *Users* (Page {page + 1}/{pages})\n\n"
+        text += "".join(format_user_record(item) + "\n" for item in users_page)
+        if not users_page:
+            text += "No Premium or admin users."
+        keyboard = []
+        if page > 0:
+            keyboard.append({"text": "← Back", "callback_data": f"admin_users_{page - 1}"})
+        if page < pages - 1:
+            keyboard.append({"text": "Next →", "callback_data": f"admin_users_{page + 1}"})
+        keyboard.append({"text": "🔙 Admin Panel", "callback_data": "admin_panel"})
+        edit_msg(chat_id, msg_id, text, keyboard, parse_mode="Markdown")
+        answer_callback(callback_id)
+        return
+
     if data.startswith("admin_keys_"):
         if not is_admin(chat_id):
             answer_callback(callback_id, "❌ Unauthorized", alert=True)
