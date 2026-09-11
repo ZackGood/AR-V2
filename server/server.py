@@ -425,7 +425,12 @@ def handle_command(chat_id, username, first_name, command, args):
             conn.execute("INSERT INTO license_keys(key, created_at, duration_days, max_uses, uses, status, created_by) VALUES(?,?,?,?,?,?,?)",
                          (key, int(time.time()), days, uses, 0, "active", chat_id))
             conn.commit()
-        send_msg(chat_id, f"🔑 Key Generated:\n\n`{key}`", parse_mode="Markdown")
+        send_msg(chat_id, f"Key generated successfully\n\n"
+                          f"Key: `{key}`\n"
+                          f"Duration: {days} days\n"
+                          f"Max uses: {uses}\n"
+                          f"Uses remaining: {uses}\n"
+                          f"Status: active", parse_mode="Markdown")
         return True
 
     if command == "/keys":
@@ -626,11 +631,10 @@ def show_user_panel(chat_id, msg_id=None):
             text += "\n⚠️ Premium expired. OTP is blocked; redeem a license key."
     
     keyboard = [
-        [{"text": "💎 Premium Status", "callback_data": "premium_status"}],
-        [{"text": "🔐 OTP Access", "callback_data": "otp_access"},
+        [{"text": "🔐 Request OTP", "callback_data": "request_otp"},
          {"text": "📊 My Stats", "callback_data": "user_stats"}],
         [{"text": "🎟️ Redeem Key", "callback_data": "redeem_key"},
-         {"text": "🔐 Request OTP", "callback_data": "request_otp"}],
+         ],
     ]
     if is_admin(chat_id):
         keyboard.append([{"text": "🛠️ Admin Panel", "callback_data": "admin_panel"}])
@@ -706,48 +710,6 @@ def handle_callback(callback_id, from_id, msg_id, chat_id, data):
         answer_callback(callback_id)
         return
 
-    if data == "premium_status":
-        if not user:
-            answer_callback(callback_id, "Not registered", alert=True)
-            return
-        expire_premium(user)
-        user = get_user(chat_id)
-        if is_premium(user):
-            expires = time.strftime("%Y-%m-%d %H:%M", time.localtime(user["premium_until"]))
-            text = (f"💎 *Premium Status*\n\n✅ Premium / Active\n"
-                    f"⏰ Expires: {expires}\n⏳ Remaining: {premium_remaining(user['premium_until'])}\n"
-                    f"🛡️ Role: {display_role(chat_id)}")
-        else:
-            text = "💎 *Premium Status*\n\n"
-            if user["premium_until"]:
-                expires = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(user["premium_until"]))
-                text += f"⚠️ Free / Inactive.\nPremium expired.\n⏰ Expired: {expires}\n⏳ Remaining: expired\nOTP is blocked.\n"
-            else:
-                text += "ℹ️ Free / Inactive.\n⏰ Premium until: Not set\n⏳ Remaining: 0\n"
-            text += "Premium access is required for OTP. Contact @ZackZ10 or @kiora_AR to purchase/activate Premium."
-            text += f"\n🛡️ Role: {display_role(chat_id)}"
-        edit_msg(chat_id, msg_id, text, [[{"text": "← Back", "callback_data": "back_main"}]], parse_mode="Markdown")
-        answer_callback(callback_id)
-        return
-
-    if data in ("otp_info", "otp_access"):
-        expire_premium(user)
-        user = get_user(chat_id)
-        if is_premium(user):
-            text = ("🔐 *OTP Access*\n\nPremium is required.\n"
-                    "OTP validity: 5 minutes, single-use.\n"
-                    "Successful verification creates a 24-hour session.")
-            keyboard = [[{"text": "Request OTP", "callback_data": "request_otp"}],
-                        [{"text": "← Back", "callback_data": "back_main"}]]
-        else:
-            text = (f"🔐 *OTP Access*\n\n{premium_error(user)}\n"
-                    "OTP validity: 5 minutes, single-use.\n"
-                    "Successful verification creates a 24-hour session.")
-            keyboard = [[{"text": "← Back", "callback_data": "back_main"}]]
-        edit_msg(chat_id, msg_id, text, keyboard, parse_mode="Markdown")
-        answer_callback(callback_id)
-        return
-    
     if data == "user_stats":
         if not user:
             answer_callback(callback_id, "Not registered", alert=True)
@@ -787,7 +749,7 @@ def handle_callback(callback_id, from_id, msg_id, chat_id, data):
         show_admin_panel(chat_id, msg_id)
         answer_callback(callback_id)
         return
-    
+
     if data.startswith("admin_users_"):
         if not is_admin(chat_id):
             answer_callback(callback_id, "❌ Unauthorized", alert=True)
@@ -799,25 +761,25 @@ def handle_callback(callback_id, from_id, msg_id, chat_id, data):
             return
         with db() as conn:
             all_users = conn.execute("SELECT * FROM users ORDER BY registered_at DESC").fetchall()
-        all_users = [user for user in all_users if is_listed_user(user)]
-        total = len(all_users)
+        listed_users = [item for item in all_users if is_listed_user(item)]
         per_page = 5
-        pages = max(1, (total + per_page - 1) // per_page)
-        start = page * per_page
-        users_page = all_users[start:start + per_page]
+        pages = max(1, (len(listed_users) + per_page - 1) // per_page)
+        page = min(page, pages - 1)
+        users_page = listed_users[page * per_page:(page + 1) * per_page]
         text = f"👥 *Users* (Page {page + 1}/{pages})\n\n"
-        for u in users_page:
-            text += format_user_record(u) + "\n"
+        text += "".join(format_user_record(item) + "\n" for item in users_page)
+        if not users_page:
+            text += "No Premium or admin users."
         keyboard = []
         if page > 0:
-            keyboard.append({"text": "← Back", "callback_data": f"admin_users_{page-1}"})
+            keyboard.append({"text": "← Back", "callback_data": f"admin_users_{page - 1}"})
         if page < pages - 1:
-            keyboard.append({"text": "Next →", "callback_data": f"admin_users_{page+1}"})
-        keyboard.append({"text": "🔙 Main", "callback_data": "back_main"})
+            keyboard.append({"text": "Next →", "callback_data": f"admin_users_{page + 1}"})
+        keyboard.append({"text": "🔙 Admin Panel", "callback_data": "admin_panel"})
         edit_msg(chat_id, msg_id, text, keyboard, parse_mode="Markdown")
         answer_callback(callback_id)
         return
-    
+
     if data.startswith("admin_keys_"):
         if not is_admin(chat_id):
             answer_callback(callback_id, "❌ Unauthorized", alert=True)
@@ -949,11 +911,17 @@ def handle_message(msg):
         with db() as conn:
             k = conn.execute("SELECT * FROM license_keys WHERE key=?", (key,)).fetchone()
             if not k:
-                send_msg(chat_id, "❌ Invalid key")
+                send_msg(chat_id, "❌ Invalid license key.")
                 return
             existing = conn.execute("SELECT * FROM key_redemptions WHERE key=? AND telegram_id=?", (key, chat_id)).fetchone()
             if existing:
-                send_msg(chat_id, "❌ Already redeemed this key")
+                send_msg(chat_id, "❌ You already claimed this license key.")
+                return
+            if k["status"] == "revoked":
+                send_msg(chat_id, "❌ This license key has been revoked.")
+                return
+            if k["status"] == "exhausted" or k["uses"] >= k["max_uses"]:
+                send_msg(chat_id, "❌ This license key is exhausted.")
                 return
             
             now = int(time.time())
@@ -964,17 +932,21 @@ def handle_message(msg):
                 "UPDATE license_keys SET uses=uses+1, status=CASE WHEN uses+1 >= max_uses THEN 'exhausted' ELSE status END "
                 "WHERE key=? AND status='active' AND uses < max_uses", (key,))
             if not updated.rowcount:
-                send_msg(chat_id, "❌ Key is invalid, revoked, or exhausted")
+                send_msg(chat_id, "❌ This license key is no longer available.")
                 return
             conn.execute("INSERT INTO key_redemptions(key, telegram_id, redeemed_at, premium_until) VALUES(?,?,?,?)",
                          (key, chat_id, now, new_prem))
             conn.execute("UPDATE users SET plan='premium', premium_until=? WHERE telegram_id=?", (new_prem, chat_id))
             conn.commit()
         
-        expires = time.strftime("%Y-%m-%d", time.localtime(new_prem))
-        send_msg(chat_id, f"✅ Premium activated!\n\n"
-                          f"⏳ Duration: {k['duration_days']} days\n"
-                          f"⏰ Expires: {expires}\n🎉 Enjoy!", parse_mode="Markdown")
+        uses_remaining = max(0, k["max_uses"] - k["uses"] - 1)
+        expires = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(new_prem))
+        send_msg(chat_id, f"✅ Key claimed successfully\n\n"
+                          f"Duration granted: {k['duration_days']} days\n"
+                          f"Premium: Active\n"
+                          f"Premium until: {expires}\n"
+                          f"Remaining: {premium_remaining(new_prem)}\n"
+                          f"Uses remaining: {uses_remaining}", parse_mode="Markdown")
         set_user_state(chat_id, action=None)
         show_user_panel(chat_id)
         return
@@ -997,7 +969,12 @@ def handle_message(msg):
                         (key, now, days, uses, 0, "active", chat_id))
             conn.commit()
         
-        send_msg(chat_id, f"🔑 Key Generated:\n\n`{key}`", parse_mode="Markdown")
+        send_msg(chat_id, f"Key generated successfully\n\n"
+                          f"Key: `{key}`\n"
+                          f"Duration: {days} days\n"
+                          f"Max uses: {uses}\n"
+                          f"Uses remaining: {uses}\n"
+                          f"Status: active", parse_mode="Markdown")
         set_user_state(chat_id, action=None)
         show_admin_panel(chat_id)
         return
