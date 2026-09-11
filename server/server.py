@@ -254,7 +254,7 @@ def format_user_record(user):
     user = get_user(user["telegram_id"])
     plan = "Premium" if is_premium(user) else "Free"
     status = "Active" if user["active"] and not user["revoked"] else "Revoked"
-    text = (f"`{user['telegram_id']}` | @{user['username'] or 'No username'}\n"
+    text = (f"{user['telegram_id']} | @{user['username'] or 'No username'}\n"
             f"Name: {user['first_name'] or 'No name'}\n"
             f"Role: {display_role(user['telegram_id'])} | Plan: {plan} | Status: {status}\n"
             f"Premium: {'Active' if is_premium(user) else ('Expired' if user['premium_until'] else 'Inactive')}\n"
@@ -269,7 +269,13 @@ def format_user_record(user):
     return text
 
 def is_listed_user(user):
-    return bool(user["premium_until"] or display_role(user["telegram_id"]) != "User")
+    return bool(user["active"] and not user["revoked"] and user["premium_until"])
+
+def format_admin_record(admin):
+    return (f"{admin['telegram_id']} | @{admin['username'] or 'No username'}\n"
+            f"Name: {admin['first_name'] or admin_display_name(admin)}\n"
+            f"Role: {admin_display_name(admin)} | Plan: Admin | Status: Active\n"
+            f"Registered: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(admin['added_at']))}\n\n")
 
 def format_user_info(user):
     if not user:
@@ -309,11 +315,15 @@ def send_msg(chat_id, text, keyboard=None, photo=None, **kw):
         return telegram_call("sendPhoto", payload)
     return telegram_call("sendMessage", payload)
 
-def edit_msg(chat_id, msg_id, text, keyboard=None, **kw):
-    payload = {"chat_id": chat_id, "message_id": msg_id, "text": text[:4096]}
+def edit_msg(chat_id, msg_id, text, keyboard=None, photo=False, **kw):
+    field = "caption" if photo else "text"
+    limit = 1024 if photo else 4096
+    payload = {"chat_id": chat_id, "message_id": msg_id, field: text[:limit]}
     if keyboard:
         payload["reply_markup"] = {"inline_keyboard": keyboard}
     payload.update(kw)
+    if photo:
+        return telegram_call("editMessageCaption", payload)
     try:
         return telegram_call("editMessageText", payload)
     except RuntimeError as error:
@@ -457,8 +467,8 @@ def handle_command(chat_id, username, first_name, command, args):
         with db() as conn:
             all_users = conn.execute("SELECT * FROM users ORDER BY registered_at DESC").fetchall()
         users = [user for user in all_users if is_listed_user(user)]
-        text = "👥 *Users*\n\n" + "".join(format_user_record(user) for user in users)
-        send_msg(chat_id, text if users else "👥 No users", parse_mode="Markdown")
+        text = "👥 Users\n\n" + "".join(format_user_record(user) for user in users)
+        send_msg(chat_id, text if users else "👥 No users")
         return True
 
     if command == "/givepremium":
@@ -672,7 +682,7 @@ def show_admin_panel(chat_id, msg_id=None):
     else:
         send_msg(chat_id, text, keyboard, parse_mode="Markdown")
 
-def handle_callback(callback_id, from_id, msg_id, chat_id, data):
+def handle_callback(callback_id, from_id, msg_id, chat_id, data, callback_message=None):
     user = get_user(chat_id)
 
     if data == "verify_membership":
@@ -761,23 +771,33 @@ def handle_callback(callback_id, from_id, msg_id, chat_id, data):
             return
         with db() as conn:
             all_users = conn.execute("SELECT * FROM users ORDER BY registered_at DESC").fetchall()
-        listed_users = [item for item in all_users if is_listed_user(item)]
+            all_admins = conn.execute(
+                "SELECT * FROM admins WHERE active=1 ORDER BY added_at DESC").fetchall()
+        listed_users = [("user", item) for item in all_users if is_listed_user(item)]
+        listed_ids = {item["telegram_id"] for _, item in listed_users}
+        listed_users.extend(
+            ("admin", item) for item in all_admins if item["telegram_id"] not in listed_ids)
         per_page = 5
         pages = max(1, (len(listed_users) + per_page - 1) // per_page)
         page = min(page, pages - 1)
         users_page = listed_users[page * per_page:(page + 1) * per_page]
-        text = f"👥 *Users* (Page {page + 1}/{pages})\n\n"
-        text += "".join(format_user_record(item) + "\n" for item in users_page)
+        text = f"👥 Users (Page {page + 1}/{pages})\n\n"
+        text += "".join(
+            format_user_record(item) if kind == "user" else format_admin_record(item)
+            for kind, item in users_page)
         if not users_page:
-            text += "No Premium or admin users."
+            text = "👥 No Premium or admin users."
         keyboard = []
         if page > 0:
-            keyboard.append({"text": "← Back", "callback_data": f"admin_users_{page - 1}"})
+            keyboard.append([{"text": "← Back", "callback_data": f"admin_users_{page - 1}"}])
         if page < pages - 1:
-            keyboard.append({"text": "Next →", "callback_data": f"admin_users_{page + 1}"})
-        keyboard.append({"text": "🔙 Admin Panel", "callback_data": "admin_panel"})
-        edit_msg(chat_id, msg_id, text, keyboard, parse_mode="Markdown")
-        answer_callback(callback_id)
+            keyboard.append([{"text": "Next →", "callback_data": f"admin_users_{page + 1}"}])
+        keyboard.append([{"text": "🔙 Admin Panel", "callback_data": "admin_panel"}])
+        try:
+            edit_msg(chat_id, msg_id, text, keyboard,
+                     photo=bool((callback_message or {}).get("photo")))
+        finally:
+            answer_callback(callback_id)
         return
 
     if data.startswith("admin_keys_"):
@@ -1021,7 +1041,7 @@ def telegram_poll():
                     callback = update.get("callback_query")
                     if callback:
                         handle_callback(callback["id"], callback["from"]["id"], callback["message"]["message_id"],
-                                      callback["message"]["chat"]["id"], callback["data"])
+                                      callback["message"]["chat"]["id"], callback["data"], callback["message"])
                 except Exception as e:
                     print(f"Update {update.get('update_id', '?')} failed: {e}")
         except Exception as e:
