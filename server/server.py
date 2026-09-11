@@ -12,8 +12,8 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent
 ENV_FILE = ROOT / ".env"
 DB_FILE = ROOT / "users.sqlite3"
-HOST = "127.0.0.1"
-PORT = 8787
+HOST = os.environ.get("RAILWAY_HOST", "0.0.0.0")
+PORT = int(os.environ.get("PORT", 8787))
 OTP_TTL_SECONDS = 300
 SESSION_TTL_SECONDS = 86400
 POLL_INTERVAL_SECONDS = 1
@@ -409,7 +409,7 @@ class Handler(BaseHTTPRequestHandler):
 
 if __name__ == "__main__":
     init_db()
-    print(f"Local OTP server listening on http://{HOST}:{PORT}")
+    print(f"Railway OTP server listening on http://{HOST}:{PORT}")
     print("Telegram bot commands: /start /register /stats")
     print("Put your NEW Telegram bot token in server/.env as TELEGRAM_BOT_TOKEN=...")
     print("Press Ctrl+C to stop.")
