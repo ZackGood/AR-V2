@@ -478,12 +478,7 @@ def show_user_panel(chat_id, msg_id=None):
     is_prem = is_premium(user)
     plan = "Premium" if is_prem else "Free"
     display_name = user["first_name"] or user["username"] or "User"
-    text = (f"🤖 *AR-V2*\n👋 Welcome, {display_name}!\n\n"
-            "*Information*\n• Bot Version: AR-V2\n• Operator: AR-V2 Operations\n"
-            "• Authorized Users: Telegram ID access\n• Premium Users: Premium plan access\n\n"
-            "*Capabilities*\n• Hitters: HTTP request API\n• Checkers: OTP verification\n"
-            "• Tools: License and account management\n\n"
-            f"🆔 Telegram ID: `{user['telegram_id']}`\n💎 Plan: *{plan}*")
+    text = f"👋 *Welcome, {display_name}!*\n\n🆔 Telegram ID: `{user['telegram_id']}`\n💎 Plan: *{plan}*"
     custom_welcome = get_setting("welcome_text")
     if custom_welcome:
         text = f"{custom_welcome}\n\n{text}"
@@ -494,7 +489,6 @@ def show_user_panel(chat_id, msg_id=None):
         text += "\nℹ️ Status: Free"
     
     keyboard = [
-        [{"text": "📋 Overview", "callback_data": "overview"}],
         [{"text": "🆔 My User ID", "callback_data": "user_id"},
          {"text": "💎 Premium Status", "callback_data": "premium_status"}],
         [{"text": "ℹ️ OTP Info", "callback_data": "otp_info"},
@@ -502,14 +496,10 @@ def show_user_panel(chat_id, msg_id=None):
         [{"text": "🎟️ Redeem Key", "callback_data": "redeem_key"},
          {"text": "🔐 Request OTP", "callback_data": "request_otp"}],
     ]
-    community = get_setting("community_url")
-    if community:
-        keyboard.append([{"text": "🌐 Community", "url": community}])
-    
     if is_admin(chat_id):
         keyboard.append([{"text": "🛠️ Admin Panel", "callback_data": "admin_panel"}])
     if is_owner(chat_id):
-        keyboard[0].append({"text": "⚙️ Settings", "callback_data": "settings"})
+        keyboard.append([{"text": "⚙️ Settings", "callback_data": "settings"}])
     
     try:
         if msg_id:
@@ -653,8 +643,8 @@ def handle_callback(callback_id, from_id, msg_id, chat_id, data):
         otp = f"{secrets.randbelow(1_000_000):06d}"
         now = int(time.time())
         OTPS[str(chat_id)] = {"otp": otp, "expires": now + OTP_TTL, "attempts": 0}
-        send_msg(chat_id, f"🔐 *OTP Code*\n\n`{otp}`\n\n⏱ Valid for 5 minutes", parse_mode="Markdown")
-        telegram_call("sendMessage", {"chat_id": chat_id, "text": f"✅ OTP sent!"})
+        edit_msg(chat_id, msg_id, f"🔐 *OTP Code*\n\n`{otp}`\n\n⏱ Valid for 5 minutes",
+                 [[{"text": "← Back", "callback_data": "back_main"}]], parse_mode="Markdown")
         answer_callback(callback_id)
         return
     
