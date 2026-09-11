@@ -113,6 +113,13 @@ def init_db():
             "redeemed_at": "INTEGER DEFAULT 0", "premium_until": "INTEGER DEFAULT 0",
         })
         conn.commit()
+        owner = conn.execute("SELECT telegram_id FROM admins WHERE telegram_id=?", (str(OWNER_ID),)).fetchone()
+        if not owner:
+            conn.execute("INSERT INTO admins(telegram_id, role, added_at, added_by, active) VALUES(?,?,?,?,1)",
+                         (str(OWNER_ID), "owner", int(time.time()), "system"))
+        else:
+            conn.execute("UPDATE admins SET role='owner', active=1 WHERE telegram_id=?", (str(OWNER_ID),))
+        conn.commit()
 
 def get_setting(name, default=""):
     with db() as conn:
@@ -161,9 +168,7 @@ def premium_error(user):
         return "You must register before requesting an OTP."
     if user["revoked"] or not user["active"]:
         return "Your account is inactive. Contact an administrator."
-    if user["premium_until"] and user["premium_until"] <= int(time.time()):
-        return "Premium has expired; redeem a license key."
-    return "Premium is required to request an OTP."
+    return "Premium access is required for OTP. Contact @kiora_AR to purchase/activate Premium."
 
 def expire_premium(user):
     if user and user["premium_until"] and user["premium_until"] <= int(time.time()) and user["plan"] != "free":
@@ -193,6 +198,12 @@ def is_owner(telegram_id):
         return True
     admin = get_admin(telegram_id)
     return admin and admin["role"] == "owner"
+
+def display_role(telegram_id):
+    if str(telegram_id) == str(OWNER_ID):
+        return "Dev/Zack"
+    admin = get_admin(telegram_id)
+    return "Admin" if admin and admin["active"] else "User"
 
 def send_msg(chat_id, text, keyboard=None, photo=None, **kw):
     payload = {"chat_id": chat_id}
@@ -341,7 +352,9 @@ def handle_command(chat_id, username, first_name, command, args):
         with db() as conn:
             users = conn.execute("SELECT * FROM users ORDER BY registered_at DESC LIMIT 50").fetchall()
         text = "👥 *Users*\n\n" + "".join(
-            f"`{user['telegram_id']}` | @{user['username'] or 'n/a'} | {'Premium' if is_premium(user) else 'Free'}\n"
+            f"`{user['telegram_id']}` | @{user['username'] or 'n/a'} | {display_role(user['telegram_id'])} | "
+            f"{'Premium' if is_premium(user) else 'Free'} | "
+            f"{'Active' if user['active'] and not user['revoked'] else 'Revoked'}\n"
             for user in users
         )
         send_msg(chat_id, text if users else "👥 No users", parse_mode="Markdown")
@@ -484,7 +497,9 @@ def show_user_panel(chat_id, msg_id=None):
     user = get_user(chat_id)
     is_prem = is_premium(user)
     display_name = user["first_name"] or user["username"] or "User"
-    text = f"👋 *Welcome, {display_name}!*\n\n💎 Plan: *{'Premium' if is_prem else 'Free'}*"
+    text = (f"👋 *Welcome, {display_name}!*\n\n"
+            f"💎 Plan: *{'Premium' if is_prem else 'Free'}*\n"
+            f"🛡️ Role: *{display_role(chat_id)}*")
     custom_welcome = get_setting("welcome_text")
     if custom_welcome:
         text = f"{custom_welcome}\n\n{text}"
@@ -585,13 +600,16 @@ def handle_callback(callback_id, from_id, msg_id, chat_id, data):
         if is_premium(user):
             expires = time.strftime("%Y-%m-%d %H:%M", time.localtime(user["premium_until"]))
             text = (f"💎 *Premium Status*\n\n✅ Premium / Active\n"
-                    f"⏰ Expires: {expires}\n⏳ Remaining: {premium_remaining(user['premium_until'])}")
+                    f"⏰ Expires: {expires}\n⏳ Remaining: {premium_remaining(user['premium_until'])}\n"
+                    f"🛡️ Role: {display_role(chat_id)}")
         else:
             text = "💎 *Premium Status*\n\n"
             if user["premium_until"]:
-                text += "⚠️ Premium expired.\nOTP is blocked until you redeem a license key."
+                text += "⚠️ Premium expired.\nOTP is blocked.\n"
             else:
-                text += "ℹ️ Free / Inactive.\nPremium is required for OTP access."
+                text += "ℹ️ Free / Inactive.\n"
+            text += "Premium access is required for OTP. Contact @kiora_AR to purchase/activate Premium."
+            text += f"\n🛡️ Role: {display_role(chat_id)}"
         edit_msg(chat_id, msg_id, text, [[{"text": "← Back", "callback_data": "back_main"}]], parse_mode="Markdown")
         answer_callback(callback_id)
         return
