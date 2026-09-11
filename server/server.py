@@ -61,7 +61,8 @@ def init_db():
         conn.execute("""CREATE TABLE IF NOT EXISTS users (
             telegram_id TEXT PRIMARY KEY, username TEXT DEFAULT '', first_name TEXT DEFAULT '',
             plan TEXT DEFAULT 'free', premium_until INTEGER DEFAULT 0, registered_at INTEGER NOT NULL,
-            login_count INTEGER DEFAULT 0, revoked INTEGER DEFAULT 0, active INTEGER DEFAULT 1)""")
+            login_count INTEGER DEFAULT 0, last_verified_at INTEGER DEFAULT 0,
+            revoked INTEGER DEFAULT 0, active INTEGER DEFAULT 1)""")
         conn.execute("""CREATE TABLE IF NOT EXISTS admins (
             telegram_id TEXT PRIMARY KEY, username TEXT DEFAULT '', first_name TEXT DEFAULT '',
             display_name TEXT DEFAULT 'Admin', role TEXT DEFAULT 'admin',
@@ -77,6 +78,7 @@ def init_db():
             "username": "TEXT DEFAULT ''", "first_name": "TEXT DEFAULT ''",
             "plan": "TEXT DEFAULT 'free'", "premium_until": "INTEGER DEFAULT 0",
             "registered_at": "INTEGER DEFAULT 0", "login_count": "INTEGER DEFAULT 0",
+            "last_verified_at": "INTEGER DEFAULT 0",
             "revoked": "INTEGER DEFAULT 0", "active": "INTEGER DEFAULT 1"})
         migrate_columns(conn, "admins", {
             "username": "TEXT DEFAULT ''", "first_name": "TEXT DEFAULT ''",
@@ -95,6 +97,7 @@ def init_db():
             "username": "TEXT DEFAULT ''", "first_name": "TEXT DEFAULT ''",
             "plan": "TEXT DEFAULT 'free'", "premium_until": "INTEGER DEFAULT 0",
             "registered_at": "INTEGER DEFAULT 0", "login_count": "INTEGER DEFAULT 0",
+            "last_verified_at": "INTEGER DEFAULT 0",
             "revoked": "INTEGER DEFAULT 0", "active": "INTEGER DEFAULT 1",
         })
         migrate_columns(conn, "admins", {
@@ -183,11 +186,15 @@ def notify_authentication(user, user_id, expires_at):
     display_name = user["first_name"] or user["username"] or "User"
     username = f" (@{user['username']})" if user["username"] else ""
     premium_status = "Premium active" if is_premium(user) else "Premium inactive"
+    role = display_role(user_id)
+    plan = "Premium" if is_premium(user) else "Free"
     timestamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
     remaining = premium_remaining(expires_at)
     message = (f"User authenticated / logged in\n"
                f"User: {display_name}{username}\n"
                f"Telegram ID: {user_id}\n"
+               f"Role: {role}\n"
+               f"Plan: {plan}\n"
                f"Premium status: {premium_status}\n"
                f"Timestamp: {timestamp}\n"
                f"Session remaining: {remaining}")
@@ -248,12 +255,21 @@ def format_user_record(user):
     plan = "Premium" if is_premium(user) else "Free"
     status = "Active" if user["active"] and not user["revoked"] else "Revoked"
     text = (f"`{user['telegram_id']}` | @{user['username'] or 'No username'}\n"
-            f"Role: {display_role(user['telegram_id'])} | Plan: {plan} | Status: {status}\n")
+            f"Name: {user['first_name'] or 'No name'}\n"
+            f"Role: {display_role(user['telegram_id'])} | Plan: {plan} | Status: {status}\n"
+            f"Premium: {'Active' if is_premium(user) else ('Expired' if user['premium_until'] else 'Inactive')}\n"
+            f"Registered: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(user['registered_at']))}\n"
+            f"Logins: {user['login_count']}\n")
     if user["premium_until"]:
         expires = time.strftime("%Y-%m-%d %H:%M", time.localtime(user["premium_until"]))
         remaining = premium_remaining(user["premium_until"]) if is_premium(user) else "expired"
         text += f"Premium until: {expires} ({remaining})\n"
+    if "last_verified_at" in user.keys() and user["last_verified_at"]:
+        text += f"Last verified: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(user['last_verified_at']))}\n"
     return text
+
+def is_listed_user(user):
+    return bool(user["premium_until"] or display_role(user["telegram_id"]) != "User")
 
 def format_user_info(user):
     if not user:
@@ -434,7 +450,8 @@ def handle_command(chat_id, username, first_name, command, args):
 
     if command == "/users":
         with db() as conn:
-            users = conn.execute("SELECT * FROM users ORDER BY registered_at DESC").fetchall()
+            all_users = conn.execute("SELECT * FROM users ORDER BY registered_at DESC").fetchall()
+        users = [user for user in all_users if is_listed_user(user)]
         text = "👥 *Users*\n\n" + "".join(format_user_record(user) for user in users)
         send_msg(chat_id, text if users else "👥 No users", parse_mode="Markdown")
         return True
@@ -782,6 +799,7 @@ def handle_callback(callback_id, from_id, msg_id, chat_id, data):
             return
         with db() as conn:
             all_users = conn.execute("SELECT * FROM users ORDER BY registered_at DESC").fetchall()
+        all_users = [user for user in all_users if is_listed_user(user)]
         total = len(all_users)
         per_page = 5
         pages = max(1, (total + per_page - 1) // per_page)
@@ -1123,6 +1141,10 @@ class Handler(BaseHTTPRequestHandler):
             session = secrets.token_urlsafe(18)
             SESSIONS[session] = {"user_id": user_id, "expires_at": now + SESSION_TTL}
             upsert_user(user_id, user["username"], user["first_name"], increment_login=True)
+            with db() as conn:
+                conn.execute("UPDATE users SET last_verified_at=? WHERE telegram_id=?",
+                             (now, user_id))
+                conn.commit()
             user = get_user(user_id)
             expires_at = SESSIONS[session]["expires_at"]
             notify_user_authenticated(user_id, expires_at)
