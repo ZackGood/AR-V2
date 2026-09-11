@@ -121,7 +121,23 @@ def get_user(telegram_id):
         return conn.execute("SELECT * FROM users WHERE telegram_id=?", (str(telegram_id),)).fetchone()
 
 def is_premium(user):
-    return user and user["premium_until"] and user["premium_until"] > int(time.time())
+    return bool(user and user["active"] and not user["revoked"] and
+                user["premium_until"] and user["premium_until"] > int(time.time()))
+
+def premium_error(user):
+    if not user:
+        return "You must register before requesting an OTP."
+    if user["revoked"] or not user["active"]:
+        return "Your account is inactive. Contact an administrator."
+    if user["premium_until"] and user["premium_until"] <= int(time.time()):
+        return "Premium has expired; redeem a license key."
+    return "Premium is required to request an OTP."
+
+def expire_premium(user):
+    if user and user["premium_until"] and user["premium_until"] <= int(time.time()) and user["plan"] != "free":
+        with db() as conn:
+            conn.execute("UPDATE users SET plan='free' WHERE telegram_id=?", (user["telegram_id"],))
+            conn.commit()
 
 def get_admin(telegram_id):
     with db() as conn:
@@ -171,10 +187,9 @@ def handle_command(chat_id, username, first_name, command, args):
 
     if command == "/otp":
         user = get_user(chat_id)
-        if not user:
-            send_msg(chat_id, "❌ Not registered. Use /register")
-        elif not is_premium(user):
-            send_msg(chat_id, "❌ Premium required!")
+        expire_premium(user)
+        if not is_premium(user):
+            send_msg(chat_id, f"❌ {premium_error(user)}")
         else:
             otp = f"{secrets.randbelow(1_000_000):06d}"
             OTPS[chat_id] = {"otp": otp, "expires": int(time.time()) + OTP_TTL, "attempts": 0}
@@ -198,9 +213,6 @@ def handle_command(chat_id, username, first_name, command, args):
             return True
 
     if command == "/key":
-        if not is_owner(chat_id):
-            send_msg(chat_id, "❌ Owner only")
-            return True
         if len(args) not in (1, 2):
             send_msg(chat_id, "Usage: /key <days> [uses]")
             return True
@@ -490,11 +502,9 @@ def handle_callback(callback_id, from_id, msg_id, chat_id, data):
         return
     
     if data == "request_otp":
-        if not user:
-            answer_callback(callback_id, "Not registered", alert=True)
-            return
+        expire_premium(user)
         if not is_premium(user):
-            answer_callback(callback_id, "❌ Premium required!", alert=True)
+            answer_callback(callback_id, premium_error(user), alert=True)
             return
         otp = f"{secrets.randbelow(1_000_000):06d}"
         now = int(time.time())
@@ -590,8 +600,8 @@ def handle_callback(callback_id, from_id, msg_id, chat_id, data):
         return
     
     if data == "admin_genkey":
-        if not is_owner(chat_id):
-            answer_callback(callback_id, "❌ Owner only", alert=True)
+        if not is_admin(chat_id):
+            answer_callback(callback_id, "❌ Unauthorized", alert=True)
             return
         send_msg(chat_id, "🔑 Send key format: <days> <uses>\nExample: 30 1")
         set_user_state(chat_id, action="genkey")
@@ -658,15 +668,6 @@ def handle_message(msg):
             if not k:
                 send_msg(chat_id, "❌ Invalid key")
                 return
-            if k["status"] != "active":
-                send_msg(chat_id, f"❌ Key is {k['status']}")
-                return
-            if k["uses"] >= k["max_uses"]:
-                conn.execute("UPDATE license_keys SET status='exhausted' WHERE key=?", (key,))
-                conn.commit()
-                send_msg(chat_id, "❌ Key exhausted")
-                return
-            
             existing = conn.execute("SELECT * FROM key_redemptions WHERE key=? AND telegram_id=?", (key, chat_id)).fetchone()
             if existing:
                 send_msg(chat_id, "❌ Already redeemed this key")
@@ -675,10 +676,14 @@ def handle_message(msg):
             now = int(time.time())
             current_prem = user["premium_until"] if user["premium_until"] else now
             new_prem = max(current_prem, now) + (k["duration_days"] * 86400)
-            
+            updated = conn.execute(
+                "UPDATE license_keys SET uses=uses+1, status=CASE WHEN uses+1 >= max_uses THEN 'exhausted' ELSE status END "
+                "WHERE key=? AND status='active' AND uses < max_uses", (key,))
+            if not updated.rowcount:
+                send_msg(chat_id, "❌ Key is invalid, revoked, or exhausted")
+                return
             conn.execute("INSERT INTO key_redemptions(key, telegram_id, redeemed_at, premium_until) VALUES(?,?,?,?)",
-                        (key, chat_id, now, new_prem))
-            conn.execute("UPDATE license_keys SET uses=uses+1 WHERE key=?", (key,))
+                         (key, chat_id, now, new_prem))
             conn.execute("UPDATE users SET plan='premium', premium_until=? WHERE telegram_id=?", (new_prem, chat_id))
             conn.commit()
         
@@ -793,11 +798,12 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/request-otp":
             user_id = str(data.get("userId", "")).strip()
             user = get_user(user_id)
-            if not user or not is_premium(user):
+            expire_premium(user)
+            if not is_premium(user):
                 self.send_response(403)
                 self.send_header("Content-Type", "application/json")
                 self.end_headers()
-                self.wfile.write(b'{"success":false,"error":"Premium required"}')
+                self.wfile.write(json.dumps({"success": False, "error": premium_error(user)}).encode())
                 return
             otp = f"{secrets.randbelow(1_000_000):06d}"
             now = int(time.time())
@@ -818,6 +824,8 @@ class Handler(BaseHTTPRequestHandler):
             record = OTPS.get(user_id)
             now = int(time.time())
             if not record or record["expires"] < now or otp != record["otp"]:
+                if record and record["expires"] < now:
+                    OTPS.pop(user_id, None)
                 self.send_response(401)
                 self.send_header("Content-Type", "application/json")
                 self.end_headers()
@@ -825,11 +833,12 @@ class Handler(BaseHTTPRequestHandler):
                 return
             OTPS.pop(user_id, None)
             user = get_user(user_id)
+            expire_premium(user)
             if not is_premium(user):
                 self.send_response(403)
                 self.send_header("Content-Type", "application/json")
                 self.end_headers()
-                self.wfile.write(b'{"success":false,"error":"Premium expired"}')
+                self.wfile.write(json.dumps({"success": False, "error": premium_error(user)}).encode())
                 return
             session = secrets.token_urlsafe(18)
             SESSIONS[session] = {"user_id": user_id, "expires": now + SESSION_TTL}
@@ -846,7 +855,11 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/validate-token":
             token = str(data.get("token", "")).strip()
             record = SESSIONS.get(token)
-            if not record or record["expires"] < int(time.time()):
+            now = int(time.time())
+            token_user = get_user(record["user_id"]) if record else None
+            if not record or record["expires"] <= now or not token_user or not token_user["active"] or token_user["revoked"]:
+                if record and record["expires"] <= now:
+                    SESSIONS.pop(token, None)
                 self.send_response(401)
                 self.send_header("Content-Type", "application/json")
                 self.end_headers()
