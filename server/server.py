@@ -106,19 +106,24 @@ def is_owner(telegram_id):
     return admin and admin["role"] == "owner"
 
 def send_msg(chat_id, text, keyboard=None, photo=None, **kw):
-    payload = {"chat_id": chat_id, "text": text[:4096]}
+    payload = {"chat_id": chat_id}
+    if photo:
+        payload["photo"] = photo
+        payload["caption"] = text[:1024]
+    else:
+        payload["text"] = text[:4096]
     if keyboard:
         payload["reply_markup"] = {"inline_keyboard": keyboard}
     payload.update(kw)
     if photo:
-        payload["photo"] = photo
         return telegram_call("sendPhoto", payload)
     return telegram_call("sendMessage", payload)
 
-def edit_msg(chat_id, msg_id, text, keyboard=None):
+def edit_msg(chat_id, msg_id, text, keyboard=None, **kw):
     payload = {"chat_id": chat_id, "message_id": msg_id, "text": text[:4096]}
     if keyboard:
         payload["reply_markup"] = {"inline_keyboard": keyboard}
+    payload.update(kw)
     return telegram_call("editMessageText", payload)
 
 def answer_callback(callback_id, text="", alert=False):
