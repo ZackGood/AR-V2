@@ -203,7 +203,19 @@ def display_role(telegram_id):
     if str(telegram_id) == str(OWNER_ID):
         return "Dev/Zack"
     admin = get_admin(telegram_id)
-    return "Admin" if admin and admin["active"] else "User"
+    return "Seller/Admin" if admin and admin["active"] else "User"
+
+def format_user_record(user):
+    expire_premium(user)
+    user = get_user(user["telegram_id"])
+    plan = "Premium" if is_premium(user) else "Free"
+    status = "Active" if user["active"] and not user["revoked"] else "Revoked"
+    text = (f"`{user['telegram_id']}` | @{user['username'] or 'No username'}\n"
+            f"Role: {display_role(user['telegram_id'])} | Plan: {plan} | Status: {status}\n")
+    if is_premium(user):
+        expires = time.strftime("%Y-%m-%d %H:%M", time.localtime(user["premium_until"]))
+        text += f"Premium until: {expires} ({premium_remaining(user['premium_until'])})\n"
+    return text
 
 def send_msg(chat_id, text, keyboard=None, photo=None, **kw):
     payload = {"chat_id": chat_id}
@@ -350,13 +362,8 @@ def handle_command(chat_id, username, first_name, command, args):
 
     if command == "/users":
         with db() as conn:
-            users = conn.execute("SELECT * FROM users ORDER BY registered_at DESC LIMIT 50").fetchall()
-        text = "👥 *Users*\n\n" + "".join(
-            f"`{user['telegram_id']}` | @{user['username'] or 'n/a'} | {display_role(user['telegram_id'])} | "
-            f"{'Premium' if is_premium(user) else 'Free'} | "
-            f"{'Active' if user['active'] and not user['revoked'] else 'Revoked'}\n"
-            for user in users
-        )
+            users = conn.execute("SELECT * FROM users ORDER BY registered_at DESC").fetchall()
+        text = "👥 *Users*\n\n" + "".join(format_user_record(user) for user in users)
         send_msg(chat_id, text if users else "👥 No users", parse_mode="Markdown")
         return True
 
@@ -415,7 +422,7 @@ def handle_command(chat_id, username, first_name, command, args):
                          (args[0], target["username"] if target else "", target["first_name"] if target else "",
                           "admin", int(time.time()), chat_id))
             conn.commit()
-        send_msg(chat_id, "✅ Admin added")
+        send_msg(chat_id, "✅ Admin/Seller added successfully")
         return True
 
     if command == "/removeadmin":
@@ -438,7 +445,9 @@ def handle_command(chat_id, username, first_name, command, args):
         with db() as conn:
             admins = conn.execute("SELECT * FROM admins WHERE active=1 ORDER BY added_at DESC").fetchall()
         text = "👮 *Admins*\n\n" + "".join(
-            f"{'👑' if admin['role'] == 'owner' else '🛡'} {admin['role']} | ID: {admin['telegram_id']}\n"
+            f"{'👑 Dev/Zack' if admin['telegram_id'] == str(OWNER_ID) else '🛡 Seller/Admin'} | "
+            f"ID: {admin['telegram_id']} | @{admin['username'] or 'No username'} | "
+            f"Active | Added: {time.strftime('%Y-%m-%d', time.localtime(admin['added_at']))}\n"
             for admin in admins
         )
         send_msg(chat_id, text, parse_mode="Markdown")
@@ -672,8 +681,7 @@ def handle_callback(callback_id, from_id, msg_id, chat_id, data):
         users_page = all_users[start:start + per_page]
         text = f"👥 *Users* (Page {page + 1}/{pages})\n\n"
         for u in users_page:
-            plan = "Premium" if is_premium(u) else "Free"
-            text += f"`{u['telegram_id']}` | @{u['username'] or 'n/a'} | {plan}\n"
+            text += format_user_record(u) + "\n"
         keyboard = []
         if page > 0:
             keyboard.append({"text": "← Back", "callback_data": f"admin_users_{page-1}"})
