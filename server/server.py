@@ -631,7 +631,7 @@ def show_user_panel(chat_id, msg_id=None):
             text += "\n⚠️ Premium expired. OTP is blocked; redeem a license key."
     
     keyboard = [
-        [{"text": "🔐 Request OTP", "callback_data": "otp_access"},
+        [{"text": "🔐 Request OTP", "callback_data": "request_otp"},
          {"text": "📊 My Stats", "callback_data": "user_stats"}],
         [{"text": "🎟️ Redeem Key", "callback_data": "redeem_key"},
          ],
@@ -709,28 +709,6 @@ def handle_callback(callback_id, from_id, msg_id, chat_id, data):
         answer_callback(callback_id)
         return
 
-    if data == "otp_access":
-        expire_premium(user)
-        user = get_user(chat_id)
-        if is_premium(user):
-            text = ("🔐 *OTP Access*\n\nPremium is required.\n"
-                    "OTP validity: 5 minutes, single-use.\n"
-                    "Successful verification creates a 24-hour session.")
-            keyboard = [[{"text": "Request OTP", "callback_data": "request_otp"}],
-                        [{"text": "← Back", "callback_data": "back_main"}]]
-        else:
-            text = "🔐 *Request OTP*\n\n"
-            if not user:
-                text += "❌ You are not registered. Use /register."
-            elif str(chat_id) == str(OWNER_ID):
-                text += owner_otp_blocked()
-            else:
-                text += "Premium access is required for OTP. Contact @ZackZ10 or @kiora_AR."
-            keyboard = [[{"text": "← Back", "callback_data": "back_main"}]]
-        edit_msg(chat_id, msg_id, text, keyboard, parse_mode="Markdown")
-        answer_callback(callback_id)
-        return
-    
     if data == "user_stats":
         if not user:
             answer_callback(callback_id, "Not registered", alert=True)
